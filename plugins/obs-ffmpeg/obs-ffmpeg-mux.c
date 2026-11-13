@@ -1067,17 +1067,14 @@ static void find_next_replay_keyframe(void *data, calldata_t *cd)
 static void request_replay_full_frame(void *data, calldata_t *cd)
 {
 	struct ffmpeg_muxer *stream = data;
-	const long long seq_int = calldata_int(cd, "seq");
+	const int64_t time_usec = calldata_int(cd, "time_usec");
 	const uint64_t request_id = (uint64_t)calldata_int(cd, "request_id");
 	bool accepted = false;
 
-	if (seq_int >= 0) {
-		pthread_mutex_lock(&stream->replay_buffer_mutex);
-		if (stream->frame_decoder)
-			accepted = replay_buffer_frame_decoder_request(stream->frame_decoder, (uint64_t)seq_int,
-								       request_id);
-		pthread_mutex_unlock(&stream->replay_buffer_mutex);
-	}
+	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	if (stream->frame_decoder)
+		accepted = replay_buffer_frame_decoder_request(stream->frame_decoder, time_usec, request_id);
+	pthread_mutex_unlock(&stream->replay_buffer_mutex);
 
 	calldata_set_int(cd, "accepted", accepted ? 1 : 0);
 }
@@ -1242,7 +1239,7 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 			 find_prev_replay_keyframe, stream);
 	proc_handler_add(ph, "void find_next_replay_keyframe(int time_usec, out int index, out int dts_usec)",
 			 find_next_replay_keyframe, stream);
-	proc_handler_add(ph, "void request_replay_full_frame(int seq, int request_id, out int accepted)",
+	proc_handler_add(ph, "void request_replay_full_frame(int time_usec, int request_id, out int accepted)",
 			 request_replay_full_frame, stream);
 	proc_handler_add(ph,
 			 "void copy_replay_full_frame(int request_id, int capacity, in ptr dst, "

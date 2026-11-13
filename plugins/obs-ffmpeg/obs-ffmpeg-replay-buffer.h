@@ -69,6 +69,13 @@ bool replay_buffer_cache_ref_packet(replay_buffer_cache_t *cache, uint64_t seq, 
  * parameter sets live: encoders only repeat them at the very start of the
  * session, so later keyframes cannot be decoded on their own. */
 bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct encoder_packet *packet);
+/* Refs the video keyframe closest to time_usec and reports its absolute index in
+ * the packet array, so the caller can walk the packets that follow it. */
+bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index,
+					 struct encoder_packet *packet);
+
+/* Refs the packet at that absolute index. */
+bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, size_t index, struct encoder_packet *packet);
 
 /* Whole-buffer snapshot used by the save path. */
 replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cache_t *cache);

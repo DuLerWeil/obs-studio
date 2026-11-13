@@ -1559,16 +1559,7 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 	const int64_t dts = calldata_int(&query, "dts_usec");
 	calldata_free(&query);
 
-	long long seq = -1;
-	if (index >= 0) {
-		calldata_t lookup = {0};
-		calldata_set_int(&lookup, "index", index);
-		proc_handler_call(ph, "get_replay_keyframe_info", &lookup);
-		seq = calldata_int(&lookup, "seq");
-		calldata_free(&lookup);
-	}
-
-	if (seq < 0) {
+	if (index < 0) {
 		if (snap) {
 			blog(LOG_INFO, "[replay buffer] review %.3fs: no keyframe at this position",
 			     (double)positionUsec_ / 1000000.0);
@@ -1580,8 +1571,8 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 	}
 
 	if (snap) {
-		blog(LOG_INFO, "[replay buffer] review %.3fs: keyframe %lld (seq %lld)",
-		     (double)positionUsec_ / 1000000.0, index, seq);
+		blog(LOG_INFO, "[replay buffer] review %.3fs: keyframe %lld at %.3fs",
+		     (double)positionUsec_ / 1000000.0, index, (double)dts / 1000000.0);
 	}
 
 	/* Snap the playhead to the keyframe that will actually be shown, so the
@@ -1597,9 +1588,9 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 		UpdateReviewState();
 	}
 
-	RequestFullFrame((uint64_t)seq);
+	RequestFullFrame(dts);
 }
-void OBSReplayBufferPanel::RequestFullFrame(uint64_t seq)
+void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 {
 	if (!visible_ || !Active()) {
 		return;
@@ -1614,7 +1605,7 @@ void OBSReplayBufferPanel::RequestFullFrame(uint64_t seq)
 	const uint64_t requestId = ++fullFrameRequestId_;
 
 	calldata_t cd = {0};
-	calldata_set_int(&cd, "seq", (long long)seq);
+	calldata_set_int(&cd, "time_usec", time_usec);
 	calldata_set_int(&cd, "request_id", (long long)requestId);
 	proc_handler_call(ph, "request_replay_full_frame", &cd);
 	const long long accepted = calldata_int(&cd, "accepted");

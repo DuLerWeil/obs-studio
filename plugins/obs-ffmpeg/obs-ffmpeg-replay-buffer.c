@@ -648,7 +648,8 @@ bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct
 		if (seq >= cache->first_seq) {
 			const uint64_t packet_index = seq - cache->first_seq;
 			if (packet_index < cache_packet_count(cache)) {
-				obs_encoder_packet_ref(packet, &cache->packets.array[cache->packets_head + (size_t)packet_index]);
+				obs_encoder_packet_ref(
+					packet, &cache->packets.array[cache->packets_head + (size_t)packet_index]);
 				found = true;
 			}
 		}
@@ -673,6 +674,68 @@ bool replay_buffer_cache_ref_packet(replay_buffer_cache_t *cache, uint64_t seq, 
 					       &cache->packets.array[cache->packets_head + (size_t)packet_index]);
 			found = true;
 		}
+	}
+
+	if (found && packet->type != OBS_ENCODER_VIDEO) {
+		blog(LOG_INFO,
+		     "[replay buffer] ref seq %llu -> index %llu of %llu (head %zu, num %zu, first %llu, next %llu) type %d",
+		     (unsigned long long)seq, (unsigned long long)(seq - cache->first_seq),
+		     (unsigned long long)cache_packet_count(cache), cache->packets_head, cache->packets.num,
+		     (unsigned long long)cache->first_seq, (unsigned long long)cache->next_seq, (int)packet->type);
+	}
+
+	pthread_mutex_unlock(&cache->mutex);
+	return found;
+}
+
+bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index,
+					 struct encoder_packet *packet)
+{
+	if (!cache || !index || !packet)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&cache->mutex);
+
+	/* Walk the packets themselves instead of going through the keyframe index:
+	 * the index stores sequence numbers, and a sequence that no longer lines up
+	 * with the array handed the decoder an audio packet. */
+	int64_t best_delta = 0;
+	for (size_t i = cache->packets_head; i < cache->packets.num; i++) {
+		const struct encoder_packet *candidate = &cache->packets.array[i];
+		if (candidate->type != OBS_ENCODER_VIDEO || !candidate->keyframe)
+			continue;
+
+		const int64_t delta = candidate->dts_usec > time_usec ? candidate->dts_usec - time_usec
+								      : time_usec - candidate->dts_usec;
+		if (!found || delta < best_delta) {
+			best_delta = delta;
+			*index = i;
+			found = true;
+		}
+	}
+
+	if (found) {
+		obs_encoder_packet_ref(packet, &cache->packets.array[*index]);
+		blog(LOG_INFO, "[replay buffer] keyframe at index %zu (dts %.3fs, requested %.3fs)", *index,
+		     (double)packet->dts_usec / 1000000.0, (double)time_usec / 1000000.0);
+	}
+
+	pthread_mutex_unlock(&cache->mutex);
+	return found;
+}
+
+bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, size_t index, struct encoder_packet *packet)
+{
+	if (!cache || !packet)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&cache->mutex);
+
+	if (index >= cache->packets_head && index < cache->packets.num) {
+		obs_encoder_packet_ref(packet, &cache->packets.array[index]);
+		found = true;
 	}
 
 	pthread_mutex_unlock(&cache->mutex);

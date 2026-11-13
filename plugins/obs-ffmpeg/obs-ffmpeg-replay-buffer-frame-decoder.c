@@ -43,7 +43,7 @@ struct replay_buffer_frame_decoder {
 	pthread_cond_t cond;
 	bool stopping;
 	bool has_request;
-	uint64_t seq;
+	int64_t request_time_usec;
 	uint64_t request_id;
 	uint64_t latest_id;
 	bool has_result;
@@ -402,29 +402,38 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	*out_height = (uint32_t)height;
 	return true;
 }
-static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t seq, uint64_t request_id)
+static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t time_usec, uint64_t request_id)
 {
 	uint8_t *rgba = NULL;
 	uint32_t width = 0;
 	uint32_t height = 0;
 	bool decoded = false;
 
-	/* Feed the requested keyframe plus the packets after it: with B-frames and an
-	 * open GOP (NVENC emits CRA frames) the decoder may not output anything until
-	 * it has seen a good part of the GOP, and a lone keyframe then decodes to
-	 * nothing. */
-	struct encoder_packet packets[33];
+	/* Resolve the packet by walking the buffer, not by sequence number: the
+	 * index and the packet array can disagree, and a keyframe sequence then named
+	 * an audio packet, which is not decodable at all. */
+	size_t index = 0;
 	size_t count = 0;
-	const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
-	for (size_t i = 0; i < max_packets; i++) {
-		struct encoder_packet packet;
-		if (!replay_buffer_cache_ref_packet(frame_decoder->cache, seq + i, &packet))
-			break;
-		if (i == 0 && !(packet.type == OBS_ENCODER_VIDEO && packet.keyframe)) {
-			obs_encoder_packet_release(&packet);
-			break;
+	struct encoder_packet packets[33];
+
+	struct encoder_packet keyframe;
+	if (replay_buffer_cache_ref_keyframe_at(frame_decoder->cache, time_usec, &index, &keyframe)) {
+		packets[count++] = keyframe;
+
+		/* Encoders with B-frames (and an open GOP) may not output the keyframe
+		 * until they have seen more input, so take the video packets that
+		 * follow it as well. */
+		const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
+		for (size_t i = index + 1; i < index + 64 && count < max_packets; i++) {
+			struct encoder_packet packet;
+			if (!replay_buffer_cache_ref_packet_at(frame_decoder->cache, i, &packet))
+				break;
+			if (packet.type != OBS_ENCODER_VIDEO) {
+				obs_encoder_packet_release(&packet);
+				continue;
+			}
+			packets[count++] = packet;
 		}
-		packets[count++] = packet;
 	}
 
 	if (count) {
@@ -433,20 +442,8 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t
 		for (size_t i = 0; i < count; i++)
 			obs_encoder_packet_release(&packets[i]);
 	} else {
-		/* Nothing was taken from the cache: either the sequence number is gone or
-		 * it does not point at a video keyframe. Say which, because those two have
-		 * very different fixes. */
-		struct encoder_packet probe;
-		if (replay_buffer_cache_ref_packet(frame_decoder->cache, seq, &probe)) {
-			blog(LOG_INFO,
-			     "[replay buffer] frame %llu: seq %llu is not a video keyframe (type %d, keyframe %d)",
-			     (unsigned long long)request_id, (unsigned long long)seq, (int)probe.type,
-			     probe.keyframe ? 1 : 0);
-			obs_encoder_packet_release(&probe);
-		} else {
-			blog(LOG_INFO, "[replay buffer] frame %llu: no packet in the cache for seq %llu",
-			     (unsigned long long)request_id, (unsigned long long)seq);
-		}
+		blog(LOG_INFO, "[replay buffer] frame %llu: no video keyframe near %.3fs",
+		     (unsigned long long)request_id, (double)time_usec / 1000000.0);
 	}
 
 	pthread_mutex_lock(&frame_decoder->mutex);
@@ -490,20 +487,20 @@ static void *frame_thread(void *param)
 			break;
 		}
 
-		const uint64_t seq = frame_decoder->seq;
+		const int64_t time_usec = frame_decoder->request_time_usec;
 		const uint64_t request_id = frame_decoder->request_id;
 		frame_decoder->has_request = false;
 		pthread_mutex_unlock(&frame_decoder->mutex);
 
-		blog(LOG_INFO, "[replay buffer] frame %llu: decoding seq %llu", (unsigned long long)request_id,
-		     (unsigned long long)seq);
-		frame_process(frame_decoder, seq, request_id);
+		blog(LOG_INFO, "[replay buffer] frame %llu: decoding at %.3fs", (unsigned long long)request_id,
+		     (double)time_usec / 1000000.0);
+		frame_process(frame_decoder, time_usec, request_id);
 	}
 
 	return NULL;
 }
 
-bool replay_buffer_frame_decoder_request(replay_buffer_frame_decoder_t *frame_decoder, uint64_t seq,
+bool replay_buffer_frame_decoder_request(replay_buffer_frame_decoder_t *frame_decoder, int64_t time_usec,
 					 uint64_t request_id)
 {
 	if (!frame_decoder || request_id == 0)
@@ -514,7 +511,7 @@ bool replay_buffer_frame_decoder_request(replay_buffer_frame_decoder_t *frame_de
 
 	if (!frame_decoder->stopping) {
 		/* Keep only the newest request in the slot. */
-		frame_decoder->seq = seq;
+		frame_decoder->request_time_usec = time_usec;
 		frame_decoder->request_id = request_id;
 		frame_decoder->latest_id = request_id;
 		frame_decoder->has_request = true;
