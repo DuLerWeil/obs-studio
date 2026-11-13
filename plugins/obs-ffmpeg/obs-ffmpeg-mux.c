@@ -1006,7 +1006,7 @@ static void get_replay_keyframe_info(void *data, calldata_t *cd)
 	if (index >= 0)
 		replay_buffer_cache_get_keyframe_info(stream->replay_cache, (size_t)index, &frame_info);
 
-	calldata_set_int(cd, "seq", (long long)frame_info.seq);
+	calldata_set_int(cd, "packet_index", (long long)frame_info.index);
 	calldata_set_int(cd, "dts_usec", frame_info.dts_usec);
 	calldata_set_int(cd, "duration_usec", frame_info.duration_usec);
 }
@@ -1230,7 +1230,7 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 			 "out int keyframe_count, out int max_time_usec)",
 			 get_replay_buffer_info, stream);
 	proc_handler_add(ph,
-			 "void get_replay_keyframe_info(int index, out int seq, out int dts_usec, "
+			 "void get_replay_keyframe_info(int index, out int packet_index, out int dts_usec, "
 			 "out int duration_usec)",
 			 get_replay_keyframe_info, stream);
 	proc_handler_add(ph, "void find_replay_keyframe(int time_usec, out int index, out int dts_usec)",

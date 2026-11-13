@@ -1,36 +1,46 @@
 #include "obs-ffmpeg-replay-buffer.h"
 
+#include <obs-module.h>
 #include <util/bmem.h>
 #include <util/darray.h>
 #include <util/threading.h>
 
-#include <stdint.h>
 #include <string.h>
 
-/* Keeps a bounded window of encoded packets and a keyframe-only index. The
- * index is what makes timeline scrubbing cheap: a time lookup is a binary
- * search over keyframes, and the packet for a keyframe is found by its stable
- * sequence number. */
+/* Smallest ring the cache allocates; it doubles from here as the buffer fills. */
+#define REPLAY_BUFFER_MIN_SLOTS 1024
 
-#define REPLAY_BUFFER_PACKET_COMPACT_THRESHOLD 256
-#define REPLAY_BUFFER_KEYFRAME_COMPACT_THRESHOLD 128
+/* The packet store is a ring so eviction only moves the head pointer: the old
+ * flat array had to memmove half of the buffer every time it was compacted. */
+struct replay_buffer_packet {
+	struct encoder_packet packet;
+	/* Absolute index, stored with the packet so a lookup can verify that the
+	 * slot it landed on is the one it asked for. */
+	uint64_t index;
+};
 
-struct replay_buffer_keyframe {
-	uint64_t seq;
-	int64_t dts_usec;
+/* One GOP: a video keyframe and every packet that followed it until the next
+ * keyframe. Packets of a GOP are contiguous in the ring, so a GOP is described
+ * by where it starts and how long it is. */
+struct replay_buffer_gop {
+	int64_t start_dts_usec;
+	uint64_t first_index;
+	size_t packet_count;
 };
 
 struct replay_buffer_cache {
 	pthread_mutex_t mutex;
 
-	DARRAY(struct encoder_packet) packets;
-	size_t packets_head;
+	struct replay_buffer_packet *slots;
+	size_t capacity;
+	size_t head;
+	size_t count;
 
-	DARRAY(struct replay_buffer_keyframe) keyframes;
-	size_t keyframes_head;
+	DARRAY(struct replay_buffer_gop) gops;
+	size_t gops_head;
 
-	uint64_t first_seq;
-	uint64_t next_seq;
+	uint64_t first_index;
+	uint64_t next_index;
 	int64_t first_dts_usec;
 	int64_t last_dts_usec;
 	int64_t total_size;
@@ -38,155 +48,122 @@ struct replay_buffer_cache {
 	int64_t max_time_usec;
 
 	size_t video_track_idx;
-	int video_keyframe_count;
 };
 
 struct replay_buffer_snapshot {
 	DARRAY(struct encoder_packet) packets;
 };
 
-static size_t cache_packet_count(const replay_buffer_cache_t *cache)
+static size_t cache_gop_count(const replay_buffer_cache_t *cache)
 {
-	return cache->packets.num - cache->packets_head;
+	return cache->gops.num - cache->gops_head;
 }
 
-static size_t cache_keyframe_count(const replay_buffer_cache_t *cache)
+static struct replay_buffer_gop *cache_gop_at(const replay_buffer_cache_t *cache, size_t index)
 {
-	return cache->keyframes.num - cache->keyframes_head;
+	return &cache->gops.array[cache->gops_head + index];
 }
 
-static struct replay_buffer_keyframe *cache_keyframe_at(replay_buffer_cache_t *cache, size_t index)
+static struct replay_buffer_packet *cache_slot_at(const replay_buffer_cache_t *cache, size_t offset)
 {
-	return &cache->keyframes.array[cache->keyframes_head + index];
+	return &cache->slots[(cache->head + offset) % cache->capacity];
 }
 
-static void cache_compact_packets(replay_buffer_cache_t *cache)
+/* Maps an absolute index to its slot and checks the slot really holds it. */
+static struct replay_buffer_packet *cache_slot_for_index(const replay_buffer_cache_t *cache, uint64_t index)
 {
-	if (!cache->packets_head)
-		return;
-	if (cache->packets_head < REPLAY_BUFFER_PACKET_COMPACT_THRESHOLD &&
-	    cache->packets_head * 2 < cache->packets.num)
-		return;
+	if (index < cache->first_index)
+		return NULL;
 
-	const size_t remaining = cache->packets.num - cache->packets_head;
-	if (remaining) {
-		memmove(cache->packets.array, cache->packets.array + cache->packets_head,
-			remaining * sizeof(*cache->packets.array));
-	}
+	const uint64_t offset = index - cache->first_index;
+	if (offset >= cache->count)
+		return NULL;
 
-	cache->packets.num = remaining;
-	cache->packets_head = 0;
+	struct replay_buffer_packet *slot = cache_slot_at(cache, (size_t)offset);
+	return slot->index == index ? slot : NULL;
 }
 
-static void cache_compact_keyframes(replay_buffer_cache_t *cache)
+static bool cache_reserve_slots(replay_buffer_cache_t *cache, size_t needed)
 {
-	if (!cache->keyframes_head)
-		return;
-	if (cache->keyframes_head < REPLAY_BUFFER_KEYFRAME_COMPACT_THRESHOLD &&
-	    cache->keyframes_head * 2 < cache->keyframes.num)
-		return;
+	if (needed <= cache->capacity)
+		return true;
 
-	const size_t remaining = cache->keyframes.num - cache->keyframes_head;
-	if (remaining) {
-		memmove(cache->keyframes.array, cache->keyframes.array + cache->keyframes_head,
-			remaining * sizeof(*cache->keyframes.array));
-	}
+	size_t capacity = cache->capacity ? cache->capacity : REPLAY_BUFFER_MIN_SLOTS;
+	while (capacity < needed)
+		capacity *= 2;
 
-	cache->keyframes.num = remaining;
-	cache->keyframes_head = 0;
-}
-
-static void cache_drop_stale_keyframes(replay_buffer_cache_t *cache)
-{
-	bool removed = false;
-
-	while (cache_keyframe_count(cache) > 0) {
-		struct replay_buffer_keyframe *keyframe = &cache->keyframes.array[cache->keyframes_head];
-		if (keyframe->seq >= cache->first_seq)
-			break;
-
-		cache->keyframes_head++;
-		removed = true;
-	}
-
-	if (removed)
-		cache_compact_keyframes(cache);
-}
-
-static bool cache_can_purge(const replay_buffer_cache_t *cache)
-{
-	return cache_packet_count(cache) > 0 && cache->video_keyframe_count > 2;
-}
-
-static bool cache_purge_front(replay_buffer_cache_t *cache)
-{
-	if (!cache_packet_count(cache))
+	struct replay_buffer_packet *slots = bmalloc(sizeof(*slots) * capacity);
+	if (!slots)
 		return false;
 
-	struct encoder_packet *packet = &cache->packets.array[cache->packets_head];
-	const bool was_video_keyframe = packet->type == OBS_ENCODER_VIDEO && packet->keyframe;
-	const int64_t packet_size = (int64_t)packet->size;
+	for (size_t i = 0; i < cache->count; i++)
+		slots[i] = *cache_slot_at(cache, i);
 
-	if (was_video_keyframe && cache->video_keyframe_count > 0)
-		cache->video_keyframe_count--;
+	bfree(cache->slots);
+	cache->slots = slots;
+	cache->capacity = capacity;
+	cache->head = 0;
+	return true;
+}
 
-	obs_encoder_packet_release(packet);
-	cache->packets_head++;
-	cache->first_seq++;
-	cache->total_size -= packet_size;
-	if (cache->total_size < 0)
-		cache->total_size = 0;
+static void cache_compact_gops(replay_buffer_cache_t *cache)
+{
+	if (!cache->gops_head)
+		return;
 
-	cache_drop_stale_keyframes(cache);
+	const size_t remaining = cache->gops.num - cache->gops_head;
+	if (remaining)
+		memmove(cache->gops.array, cache->gops.array + cache->gops_head,
+			remaining * sizeof(*cache->gops.array));
 
-	if (!cache_packet_count(cache)) {
-		cache->packets.num = 0;
-		cache->packets_head = 0;
+	cache->gops.num = remaining;
+	cache->gops_head = 0;
+}
+
+static void cache_drop_front_gop(replay_buffer_cache_t *cache)
+{
+	struct replay_buffer_gop *gop = cache_gop_at(cache, 0);
+
+	for (size_t i = 0; i < gop->packet_count && cache->count; i++) {
+		struct replay_buffer_packet *slot = cache_slot_at(cache, 0);
+		cache->total_size -= (int64_t)slot->packet.size;
+		obs_encoder_packet_release(&slot->packet);
+		cache->head = (cache->head + 1) % cache->capacity;
+		cache->count--;
+		cache->first_index++;
+	}
+
+	cache->gops_head++;
+	cache_compact_gops(cache);
+
+	if (!cache->count) {
 		cache->first_dts_usec = 0;
 		cache->last_dts_usec = 0;
 		cache->total_size = 0;
 	} else {
-		cache->first_dts_usec = cache->packets.array[cache->packets_head].dts_usec;
+		cache->first_dts_usec = cache_slot_at(cache, 0)->packet.dts_usec;
 	}
-
-	return was_video_keyframe;
 }
 
-/* Drops one whole GOP so that the buffer always starts at a video keyframe. */
-static void cache_purge_gop(replay_buffer_cache_t *cache)
+/* Two GOPs are always kept: one to serve as the start of an export, one to hold
+ * whatever is being written right now. */
+static void cache_trim(replay_buffer_cache_t *cache)
 {
-	if (!cache_purge_front(cache))
+	const bool have_size_limit = cache->max_size_bytes > 0;
+	const bool have_time_limit = cache->max_time_usec > 0;
+	if (!have_size_limit && !have_time_limit)
 		return;
 
-	while (cache_packet_count(cache) > 0) {
-		struct encoder_packet *packet = &cache->packets.array[cache->packets_head];
-		if (packet->type == OBS_ENCODER_VIDEO && packet->keyframe)
+	while (cache_gop_count(cache) > 2) {
+		const bool over_size = have_size_limit && cache->total_size > cache->max_size_bytes;
+		const bool over_time = have_time_limit &&
+				       (cache->last_dts_usec - cache_gop_at(cache, 0)->start_dts_usec) >
+					       cache->max_time_usec;
+		if (!over_size && !over_time)
 			break;
 
-		cache_purge_front(cache);
+		cache_drop_front_gop(cache);
 	}
-
-	cache_compact_packets(cache);
-}
-
-static struct replay_buffer_keyframe *cache_find_keyframe_by_seq(replay_buffer_cache_t *cache, uint64_t seq)
-{
-	size_t low = cache->keyframes_head;
-	size_t high = cache->keyframes.num;
-
-	while (low < high) {
-		const size_t middle = low + (high - low) / 2;
-		if (cache->keyframes.array[middle].seq < seq)
-			low = middle + 1;
-		else
-			high = middle;
-	}
-
-	if (low >= cache->keyframes.num)
-		return NULL;
-
-	struct replay_buffer_keyframe *keyframe = &cache->keyframes.array[low];
-	return keyframe->seq == seq ? keyframe : NULL;
 }
 
 replay_buffer_cache_t *replay_buffer_cache_create(size_t video_track_idx)
@@ -210,8 +187,8 @@ void replay_buffer_cache_destroy(replay_buffer_cache_t *cache)
 		return;
 
 	replay_buffer_cache_clear(cache);
-	da_free(cache->packets);
-	da_free(cache->keyframes);
+	bfree(cache->slots);
+	da_free(cache->gops);
 	pthread_mutex_destroy(&cache->mutex);
 	bfree(cache);
 }
@@ -234,21 +211,20 @@ void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 
 	pthread_mutex_lock(&cache->mutex);
 
-	for (size_t i = cache->packets_head; i < cache->packets.num; i++)
-		obs_encoder_packet_release(&cache->packets.array[i]);
-	da_clear(cache->packets);
-	cache->packets_head = 0;
+	for (size_t i = 0; i < cache->count; i++)
+		obs_encoder_packet_release(&cache_slot_at(cache, i)->packet);
 
-	da_clear(cache->keyframes);
-	cache->keyframes_head = 0;
+	cache->head = 0;
+	cache->count = 0;
+	da_clear(cache->gops);
+	cache->gops_head = 0;
 
-	/* next_seq is intentionally not reset: stale asynchronous frame requests
-	 * must not match keyframes from a later session. */
-	cache->first_seq = cache->next_seq;
+	/* next_index is intentionally not reset: stale asynchronous frame requests
+	 * must not match packets from a later session. */
+	cache->first_index = cache->next_index;
 	cache->first_dts_usec = 0;
 	cache->last_dts_usec = 0;
 	cache->total_size = 0;
-	cache->video_keyframe_count = 0;
 
 	pthread_mutex_unlock(&cache->mutex);
 }
@@ -258,41 +234,44 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 	if (!cache || !packet)
 		return;
 
-	struct encoder_packet stored;
-	obs_encoder_packet_ref(&stored, packet);
+	const bool starts_gop = packet->type == OBS_ENCODER_VIDEO && packet->keyframe &&
+				packet->track_idx == cache->video_track_idx;
 
 	pthread_mutex_lock(&cache->mutex);
 
-	bool may_purge = true;
-	if (cache->max_size_bytes > 0) {
-		may_purge = cache_can_purge(cache);
-		if (may_purge) {
-			while (cache_can_purge(cache) &&
-			       cache->total_size + (int64_t)packet->size > cache->max_size_bytes)
-				cache_purge_gop(cache);
-
-			may_purge = cache_can_purge(cache);
-		}
-	}
-
-	/* A zero time limit means unlimited, matching max_size_bytes. Without the
-	 * guard every push would purge down to the two-GOP floor. */
-	if (may_purge && cache->max_time_usec > 0) {
-		while (cache_can_purge(cache) && (packet->dts_usec - cache->first_dts_usec) > cache->max_time_usec)
-			cache_purge_gop(cache);
-	}
-
-	if (!da_push_back(cache->packets, &stored)) {
-		/* Out of memory: drop the reference instead of leaking it, and leave
-		 * next_seq alone so it keeps matching the packet index. */
-		obs_encoder_packet_release(&stored);
+	/* Packets before the first video keyframe have no GOP to belong to and can
+	 * never be exported, because every export starts on a keyframe. */
+	if (!cache_gop_count(cache) && !starts_gop) {
 		pthread_mutex_unlock(&cache->mutex);
 		return;
 	}
 
-	const uint64_t seq = cache->next_seq++;
+	if (!cache_reserve_slots(cache, cache->count + 1)) {
+		pthread_mutex_unlock(&cache->mutex);
+		return;
+	}
 
-	if (cache_packet_count(cache) == 1) {
+	if (starts_gop) {
+		struct replay_buffer_gop gop = {0};
+		gop.start_dts_usec = packet->dts_usec;
+		gop.first_index = cache->next_index;
+		gop.packet_count = 1;
+
+		if (!da_push_back(cache->gops, &gop)) {
+			pthread_mutex_unlock(&cache->mutex);
+			return;
+		}
+	} else {
+		cache_gop_at(cache, cache_gop_count(cache) - 1)->packet_count++;
+	}
+
+	struct replay_buffer_packet *slot = cache_slot_at(cache, cache->count);
+	obs_encoder_packet_ref(&slot->packet, packet);
+	slot->index = cache->next_index;
+	cache->count++;
+	cache->next_index++;
+
+	if (cache->count == 1) {
 		cache->first_dts_usec = packet->dts_usec;
 		cache->last_dts_usec = packet->dts_usec;
 	} else if (packet->dts_usec > cache->last_dts_usec) {
@@ -300,17 +279,7 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 	}
 
 	cache->total_size += (int64_t)packet->size;
-
-	if (packet->type == OBS_ENCODER_VIDEO && packet->keyframe) {
-		cache->video_keyframe_count++;
-
-		if (packet->track_idx == cache->video_track_idx) {
-			struct replay_buffer_keyframe keyframe = {0};
-			keyframe.seq = seq;
-			keyframe.dts_usec = packet->dts_usec;
-			da_push_back(cache->keyframes, &keyframe);
-		}
-	}
+	cache_trim(cache);
 
 	pthread_mutex_unlock(&cache->mutex);
 }
@@ -334,7 +303,7 @@ size_t replay_buffer_cache_get_keyframe_count(replay_buffer_cache_t *cache)
 		return 0;
 
 	pthread_mutex_lock(&cache->mutex);
-	const size_t count = cache_keyframe_count(cache);
+	const size_t count = cache_gop_count(cache);
 	pthread_mutex_unlock(&cache->mutex);
 
 	return count;
@@ -351,16 +320,16 @@ bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t 
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	const size_t count = cache_keyframe_count(cache);
+	const size_t count = cache_gop_count(cache);
 	if (index < count) {
-		struct replay_buffer_keyframe *keyframe = cache_keyframe_at(cache, index);
-		info->seq = keyframe->seq;
-		info->dts_usec = keyframe->dts_usec;
+		const struct replay_buffer_gop *gop = cache_gop_at(cache, index);
+		info->index = gop->first_index;
+		info->dts_usec = gop->start_dts_usec;
 
 		if (index + 1 < count) {
-			info->duration_usec = cache_keyframe_at(cache, index + 1)->dts_usec - keyframe->dts_usec;
-		} else if (cache->last_dts_usec > keyframe->dts_usec) {
-			info->duration_usec = cache->last_dts_usec - keyframe->dts_usec;
+			info->duration_usec = cache_gop_at(cache, index + 1)->start_dts_usec - gop->start_dts_usec;
+		} else if (cache->last_dts_usec > gop->start_dts_usec) {
+			info->duration_usec = cache->last_dts_usec - gop->start_dts_usec;
 		}
 
 		found = true;
@@ -370,57 +339,15 @@ bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t 
 	return found;
 }
 
-bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
+/* Index of the last GOP whose keyframe is at or before time_usec. */
+static size_t cache_gop_lower_bound(const replay_buffer_cache_t *cache, int64_t time_usec, bool strict)
 {
-	if (!cache || !index)
-		return false;
-
-	bool found = false;
-	pthread_mutex_lock(&cache->mutex);
-
-	if (cache_keyframe_count(cache) > 0) {
-		size_t low = cache->keyframes_head;
-		size_t high = cache->keyframes.num;
-
-		while (low < high) {
-			const size_t middle = low + (high - low) / 2;
-			if (cache->keyframes.array[middle].dts_usec < time_usec)
-				low = middle + 1;
-			else
-				high = middle;
-		}
-
-		size_t best = 0;
-		if (low >= cache->keyframes.num) {
-			best = cache->keyframes.num - 1;
-		} else if (low == cache->keyframes_head) {
-			best = low;
-		} else {
-			const int64_t after = cache->keyframes.array[low].dts_usec - time_usec;
-			const int64_t before = time_usec - cache->keyframes.array[low - 1].dts_usec;
-			/* Prefer the earlier keyframe on a tie: it is never later
-			 * than the requested time. */
-			best = before <= after ? low - 1 : low;
-		}
-
-		*index = best - cache->keyframes_head;
-		found = true;
-	}
-
-	pthread_mutex_unlock(&cache->mutex);
-	return found;
-}
-
-/* First indexed keyframe whose dts is >= (strict == false) or > (strict ==
- * true) time_usec. Returned as an absolute array index. */
-static size_t cache_keyframe_lower_bound(const replay_buffer_cache_t *cache, int64_t time_usec, bool strict)
-{
-	size_t low = cache->keyframes_head;
-	size_t high = cache->keyframes.num;
+	size_t low = cache->gops_head;
+	size_t high = cache->gops.num;
 
 	while (low < high) {
 		const size_t middle = low + (high - low) / 2;
-		const int64_t dts_usec = cache->keyframes.array[middle].dts_usec;
+		const int64_t dts_usec = cache->gops.array[middle].start_dts_usec;
 		const bool before = strict ? dts_usec <= time_usec : dts_usec < time_usec;
 		if (before)
 			low = middle + 1;
@@ -431,6 +358,37 @@ static size_t cache_keyframe_lower_bound(const replay_buffer_cache_t *cache, int
 	return low;
 }
 
+bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
+{
+	if (!cache || !index)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&cache->mutex);
+
+	if (cache_gop_count(cache) > 0) {
+		size_t low = cache_gop_lower_bound(cache, time_usec, false);
+		size_t best;
+		if (low >= cache->gops.num) {
+			best = cache->gops.num - 1;
+		} else if (low == cache->gops_head) {
+			best = low;
+		} else {
+			const int64_t after = cache->gops.array[low].start_dts_usec - time_usec;
+			const int64_t before = time_usec - cache->gops.array[low - 1].start_dts_usec;
+			/* Prefer the earlier keyframe on a tie: it is never later than
+			 * the requested time. */
+			best = before <= after ? low - 1 : low;
+		}
+
+		*index = best - cache->gops_head;
+		found = true;
+	}
+
+	pthread_mutex_unlock(&cache->mutex);
+	return found;
+}
+
 bool replay_buffer_cache_find_prev_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
 {
 	if (!cache || !index)
@@ -439,9 +397,9 @@ bool replay_buffer_cache_find_prev_keyframe(replay_buffer_cache_t *cache, int64_
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	const size_t low = cache_keyframe_lower_bound(cache, time_usec, false);
-	if (low > cache->keyframes_head) {
-		*index = low - 1 - cache->keyframes_head;
+	const size_t low = cache_gop_lower_bound(cache, time_usec, false);
+	if (low > cache->gops_head) {
+		*index = low - 1 - cache->gops_head;
 		found = true;
 	}
 
@@ -457,9 +415,9 @@ bool replay_buffer_cache_find_next_keyframe(replay_buffer_cache_t *cache, int64_
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	const size_t low = cache_keyframe_lower_bound(cache, time_usec, true);
-	if (low < cache->keyframes.num) {
-		*index = low - cache->keyframes_head;
+	const size_t low = cache_gop_lower_bound(cache, time_usec, true);
+	if (low < cache->gops.num) {
+		*index = low - cache->gops_head;
 		found = true;
 	}
 
@@ -467,76 +425,46 @@ bool replay_buffer_cache_find_next_keyframe(replay_buffer_cache_t *cache, int64_
 	return found;
 }
 
-struct replay_buffer_range {
-	size_t first_packet;
-	int64_t start_usec;
-	int64_t end_usec;
-};
-
-static bool cache_packet_in_range(const struct encoder_packet *packet, int64_t start_usec, int64_t end_usec)
-{
-	if (packet->dts_usec > end_usec)
-		return false;
-	/* Audio can arrive slightly ahead of the video keyframe. Do not start
-	 * the export before the aligned keyframe. */
-	if (packet->type != OBS_ENCODER_VIDEO && packet->dts_usec < start_usec)
-		return false;
-	return true;
-}
-
+/* Resolves a range while holding the lock. Returns absolute packet indices. */
 static bool cache_resolve_range_locked(replay_buffer_cache_t *cache, int64_t start_usec, int64_t end_usec,
-				       struct replay_buffer_range *range)
+				       uint64_t *first_index, uint64_t *last_index, int64_t *actual_start_usec,
+				       int64_t *actual_end_usec)
 {
-	if (cache_keyframe_count(cache) == 0 || cache_packet_count(cache) == 0)
-		return false;
-	if (start_usec >= end_usec)
-		return false;
-	if (end_usec <= cache->first_dts_usec || start_usec >= cache->last_dts_usec)
+	if (cache_gop_count(cache) == 0 || end_usec <= start_usec)
 		return false;
 
-	if (start_usec < cache->first_dts_usec)
-		start_usec = cache->first_dts_usec;
-	if (end_usec > cache->last_dts_usec)
-		end_usec = cache->last_dts_usec;
+	const size_t after = cache_gop_lower_bound(cache, start_usec, true);
+	const size_t low = after > cache->gops_head ? after - 1 : cache->gops_head;
 
-	/* Find the last keyframe at or before the requested start. */
-	size_t low = cache->keyframes_head;
-	size_t high = cache->keyframes.num;
-	while (low < high) {
-		const size_t middle = low + (high - low) / 2;
-		if (cache->keyframes.array[middle].dts_usec <= start_usec)
-			low = middle + 1;
-		else
-			high = middle;
-	}
-
-	const size_t key_index = low == cache->keyframes_head ? cache->keyframes_head : low - 1;
-	const struct replay_buffer_keyframe *keyframe = &cache->keyframes.array[key_index];
-	const int64_t aligned_start = keyframe->dts_usec;
+	const struct replay_buffer_gop *gop = &cache->gops.array[low];
+	const int64_t aligned_start = gop->start_dts_usec;
 	if (aligned_start >= end_usec)
 		return false;
-	if (keyframe->seq < cache->first_seq)
-		return false;
 
-	const size_t first_packet = cache->packets_head + (size_t)(keyframe->seq - cache->first_seq);
-	if (first_packet >= cache->packets.num)
-		return false;
-
+	bool have_packet = false;
 	int64_t actual_end = aligned_start;
-	for (size_t i = first_packet; i < cache->packets.num; i++) {
-		const struct encoder_packet *packet = &cache->packets.array[i];
-		if (!cache_packet_in_range(packet, aligned_start, end_usec))
-			continue;
-		if (packet->dts_usec > actual_end)
-			actual_end = packet->dts_usec;
+	uint64_t last = gop->first_index;
+
+	for (uint64_t index = gop->first_index;; index++) {
+		const struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+		if (!slot)
+			break;
+		if (slot->packet.dts_usec > end_usec)
+			break;
+
+		last = index;
+		have_packet = true;
+		if (slot->packet.dts_usec > actual_end)
+			actual_end = slot->packet.dts_usec;
 	}
 
-	if (actual_end <= aligned_start)
+	if (!have_packet || actual_end <= aligned_start)
 		return false;
 
-	range->first_packet = first_packet;
-	range->start_usec = aligned_start;
-	range->end_usec = actual_end;
+	*first_index = gop->first_index;
+	*last_index = last;
+	*actual_start_usec = aligned_start;
+	*actual_end_usec = actual_end;
 	return true;
 }
 
@@ -546,19 +474,17 @@ bool replay_buffer_cache_resolve_range(replay_buffer_cache_t *cache, int64_t sta
 	if (!cache || !actual_start_usec || !actual_end_usec)
 		return false;
 
-	struct replay_buffer_range range = {0};
+	uint64_t first = 0;
+	uint64_t last = 0;
+	int64_t start = 0;
+	int64_t end = 0;
+
 	pthread_mutex_lock(&cache->mutex);
-	const bool found = cache_resolve_range_locked(cache, start_usec, end_usec, &range);
+	const bool found = cache_resolve_range_locked(cache, start_usec, end_usec, &first, &last, &start, &end);
 	pthread_mutex_unlock(&cache->mutex);
 
-	if (found) {
-		*actual_start_usec = range.start_usec;
-		*actual_end_usec = range.end_usec;
-	} else {
-		*actual_start_usec = 0;
-		*actual_end_usec = 0;
-	}
-
+	*actual_start_usec = found ? start : 0;
+	*actual_end_usec = found ? end : 0;
 	return found;
 }
 
@@ -577,18 +503,22 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
 	if (!snapshot)
 		return NULL;
 
-	struct replay_buffer_range range = {0};
-	pthread_mutex_lock(&cache->mutex);
+	uint64_t first = 0;
+	uint64_t last = 0;
+	int64_t start = 0;
+	int64_t end = 0;
 
-	const bool found = cache_resolve_range_locked(cache, start_usec, end_usec, &range);
+	pthread_mutex_lock(&cache->mutex);
+	const bool found = cache_resolve_range_locked(cache, start_usec, end_usec, &first, &last, &start, &end);
+
 	if (found) {
-		for (size_t i = range.first_packet; i < cache->packets.num; i++) {
-			struct encoder_packet *packet = &cache->packets.array[i];
-			if (!cache_packet_in_range(packet, range.start_usec, range.end_usec))
-				continue;
+		for (uint64_t index = first; index <= last; index++) {
+			const struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+			if (!slot)
+				break;
 
 			struct encoder_packet ref;
-			obs_encoder_packet_ref(&ref, packet);
+			obs_encoder_packet_ref(&ref, &slot->packet);
 			if (!da_push_back(snapshot->packets, &ref)) {
 				obs_encoder_packet_release(&ref);
 				pthread_mutex_unlock(&cache->mutex);
@@ -600,39 +530,17 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
 
 	pthread_mutex_unlock(&cache->mutex);
 
-	if (!found) {
-		bfree(snapshot);
+	if (!found || !replay_buffer_snapshot_get_packet_count(snapshot)) {
+		replay_buffer_snapshot_release(snapshot);
 		return NULL;
 	}
 
 	if (actual_start_usec)
-		*actual_start_usec = range.start_usec;
+		*actual_start_usec = start;
 	if (actual_end_usec)
-		*actual_end_usec = range.end_usec;
+		*actual_end_usec = end;
 
 	return snapshot;
-}
-
-bool replay_buffer_cache_ref_keyframe_packet(replay_buffer_cache_t *cache, uint64_t seq, struct encoder_packet *packet)
-{
-	if (!cache || !packet)
-		return false;
-
-	bool found = false;
-	pthread_mutex_lock(&cache->mutex);
-
-	struct replay_buffer_keyframe *keyframe = cache_find_keyframe_by_seq(cache, seq);
-	if (keyframe && seq >= cache->first_seq) {
-		const uint64_t packet_index = seq - cache->first_seq;
-		if (packet_index < cache_packet_count(cache)) {
-			obs_encoder_packet_ref(packet,
-					       &cache->packets.array[cache->packets_head + (size_t)packet_index]);
-			found = true;
-		}
-	}
-
-	pthread_mutex_unlock(&cache->mutex);
-	return found;
 }
 
 bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct encoder_packet *packet)
@@ -643,52 +551,20 @@ bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	if (cache_keyframe_count(cache) > 0) {
-		const uint64_t seq = cache_keyframe_at(cache, 0)->seq;
-		if (seq >= cache->first_seq) {
-			const uint64_t packet_index = seq - cache->first_seq;
-			if (packet_index < cache_packet_count(cache)) {
-				obs_encoder_packet_ref(
-					packet, &cache->packets.array[cache->packets_head + (size_t)packet_index]);
-				found = true;
-			}
-		}
-	}
-
-	pthread_mutex_unlock(&cache->mutex);
-	return found;
-}
-
-bool replay_buffer_cache_ref_packet(replay_buffer_cache_t *cache, uint64_t seq, struct encoder_packet *packet)
-{
-	if (!cache || !packet)
-		return false;
-
-	bool found = false;
-	pthread_mutex_lock(&cache->mutex);
-
-	if (seq >= cache->first_seq) {
-		const uint64_t packet_index = seq - cache->first_seq;
-		if (packet_index < cache_packet_count(cache)) {
-			obs_encoder_packet_ref(packet,
-					       &cache->packets.array[cache->packets_head + (size_t)packet_index]);
+	if (cache_gop_count(cache) > 0) {
+		const struct replay_buffer_packet *slot =
+			cache_slot_for_index(cache, cache_gop_at(cache, 0)->first_index);
+		if (slot) {
+			obs_encoder_packet_ref(packet, &slot->packet);
 			found = true;
 		}
 	}
 
-	if (found && packet->type != OBS_ENCODER_VIDEO) {
-		blog(LOG_INFO,
-		     "[replay buffer] ref seq %llu -> index %llu of %llu (head %zu, num %zu, first %llu, next %llu) type %d",
-		     (unsigned long long)seq, (unsigned long long)(seq - cache->first_seq),
-		     (unsigned long long)cache_packet_count(cache), cache->packets_head, cache->packets.num,
-		     (unsigned long long)cache->first_seq, (unsigned long long)cache->next_seq, (int)packet->type);
-	}
-
 	pthread_mutex_unlock(&cache->mutex);
 	return found;
 }
 
-bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index,
+bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t time_usec, uint64_t *index,
 					 struct encoder_packet *packet)
 {
 	if (!cache || !index || !packet)
@@ -697,70 +573,40 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	/* Fast path: the keyframe index is sorted by dts, so binary search it and
-	 * translate the sequence number into an array offset. Only when that offset
-	 * does not land on the video keyframe does the code fall back to walking the
-	 * buffer - a sequence that stopped lining up with the array used to hand the
-	 * decoder an audio packet. */
-	if (cache_keyframe_count(cache) > 0) {
-		size_t low = cache->keyframes_head;
-		size_t high = cache->keyframes.num;
-		while (low < high) {
-			const size_t middle = low + (high - low) / 2;
-			if (cache->keyframes.array[middle].dts_usec < time_usec)
-				low = middle + 1;
-			else
-				high = middle;
+	const size_t count = cache_gop_count(cache);
+	if (count > 0) {
+		size_t low = cache_gop_lower_bound(cache, time_usec, false);
+		size_t best;
+		if (low >= cache->gops.num) {
+			best = cache->gops.num - 1;
+		} else if (low == cache->gops_head) {
+			best = low;
+		} else {
+			const int64_t after = cache->gops.array[low].start_dts_usec - time_usec;
+			const int64_t before = time_usec - cache->gops.array[low - 1].start_dts_usec;
+			best = before <= after ? low - 1 : low;
 		}
-		if (low >= cache->keyframes.num)
-			low = cache->keyframes.num - 1;
 
-		const uint64_t seq = cache->keyframes.array[low].seq;
-		if (seq >= cache->first_seq) {
-			const uint64_t offset = seq - cache->first_seq;
-			if (offset < cache_packet_count(cache)) {
-				const size_t candidate = cache->packets_head + (size_t)offset;
-				const struct encoder_packet *at = &cache->packets.array[candidate];
-				if (at->type == OBS_ENCODER_VIDEO && at->keyframe) {
-					*index = candidate;
-					found = true;
-				} else {
-					blog(LOG_WARNING,
-					     "[replay buffer] keyframe index disagrees with the packets (seq %llu is type %d), scanning",
-					     (unsigned long long)seq, (int)at->type);
-				}
-			}
+		const struct replay_buffer_packet *slot =
+			cache_slot_for_index(cache, cache->gops.array[best].first_index);
+		if (slot && slot->packet.type == OBS_ENCODER_VIDEO && slot->packet.keyframe) {
+			obs_encoder_packet_ref(packet, &slot->packet);
+			*index = slot->index;
+			found = true;
 		}
-	}
-
-	if (!found) {
-		int64_t best_delta = 0;
-		for (size_t i = cache->packets_head; i < cache->packets.num; i++) {
-			const struct encoder_packet *candidate = &cache->packets.array[i];
-			if (candidate->type != OBS_ENCODER_VIDEO || !candidate->keyframe)
-				continue;
-
-			const int64_t delta = candidate->dts_usec > time_usec ? candidate->dts_usec - time_usec
-									      : time_usec - candidate->dts_usec;
-			if (!found || delta < best_delta) {
-				best_delta = delta;
-				*index = i;
-				found = true;
-			}
-		}
-	}
-
-	if (found) {
-		obs_encoder_packet_ref(packet, &cache->packets.array[*index]);
-		blog(LOG_INFO, "[replay buffer] keyframe at index %zu (dts %.3fs, requested %.3fs)", *index,
-		     (double)packet->dts_usec / 1000000.0, (double)time_usec / 1000000.0);
 	}
 
 	pthread_mutex_unlock(&cache->mutex);
+
+	if (found) {
+		blog(LOG_DEBUG, "[replay buffer] keyframe at index %llu (dts %.3fs, requested %.3fs)",
+		     (unsigned long long)*index, (double)packet->dts_usec / 1000000.0, (double)time_usec / 1000000.0);
+	}
+
 	return found;
 }
 
-bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, size_t index, struct encoder_packet *packet)
+bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t index, struct encoder_packet *packet)
 {
 	if (!cache || !packet)
 		return false;
@@ -768,8 +614,9 @@ bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, size_t inde
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	if (index >= cache->packets_head && index < cache->packets.num) {
-		obs_encoder_packet_ref(packet, &cache->packets.array[index]);
+	const struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+	if (slot) {
+		obs_encoder_packet_ref(packet, &slot->packet);
 		found = true;
 	}
 
@@ -787,16 +634,12 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cach
 		return NULL;
 
 	pthread_mutex_lock(&cache->mutex);
+	da_reserve(snapshot->packets, cache->count);
 
-	const size_t count = cache_packet_count(cache);
-	da_reserve(snapshot->packets, count);
-
-	for (size_t i = 0; i < count; i++) {
+	for (size_t i = 0; i < cache->count; i++) {
 		struct encoder_packet packet;
-		obs_encoder_packet_ref(&packet, &cache->packets.array[cache->packets_head + i]);
+		obs_encoder_packet_ref(&packet, &cache_slot_at(cache, i)->packet);
 		if (!da_push_back(snapshot->packets, &packet)) {
-			/* Out of memory: release what was taken and report failure
-			 * instead of handing out a truncated snapshot. */
 			obs_encoder_packet_release(&packet);
 			pthread_mutex_unlock(&cache->mutex);
 			replay_buffer_snapshot_release(snapshot);
@@ -805,6 +648,12 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cach
 	}
 
 	pthread_mutex_unlock(&cache->mutex);
+
+	if (!replay_buffer_snapshot_get_packet_count(snapshot)) {
+		replay_buffer_snapshot_release(snapshot);
+		return NULL;
+	}
+
 	return snapshot;
 }
 

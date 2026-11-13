@@ -412,7 +412,7 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	/* Resolve the packet by walking the buffer, not by sequence number: the
 	 * index and the packet array can disagree, and a keyframe sequence then named
 	 * an audio packet, which is not decodable at all. */
-	size_t index = 0;
+	uint64_t index = 0;
 	size_t count = 0;
 	struct encoder_packet packets[33];
 
@@ -424,7 +424,7 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 		 * until they have seen more input, so take the video packets that
 		 * follow it as well. */
 		const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
-		for (size_t i = index + 1; i < index + 64 && count < max_packets; i++) {
+		for (uint64_t i = index + 1; i < index + 64 && count < max_packets; i++) {
 			struct encoder_packet packet;
 			if (!replay_buffer_cache_ref_packet_at(frame_decoder->cache, i, &packet))
 				break;

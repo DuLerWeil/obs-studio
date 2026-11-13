@@ -62,12 +62,12 @@ static void test_push_index_and_range(void **state)
 
 	struct replay_buffer_keyframe_info info = {0};
 	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &info));
-	assert_int_equal(info.seq, 0);
+	assert_int_equal(info.index, 0);
 	assert_int_equal(info.dts_usec, 0);
 	assert_int_equal(info.duration_usec, 1000000);
 
 	assert_true(replay_buffer_cache_get_keyframe_info(cache, 1, &info));
-	assert_int_equal(info.seq, 3);
+	assert_int_equal(info.index, 3);
 	assert_int_equal(info.dts_usec, 1000000);
 	assert_int_equal(info.duration_usec, 100000);
 
@@ -116,12 +116,23 @@ static void test_eviction_keeps_index_in_sync(void **state)
 	assert_true(replay_buffer_cache_get_keyframe_info(cache, index, &info));
 	assert_int_equal(info.dts_usec, 1000000);
 
-	/* The evicted keyframe packet must no longer be reachable. */
+	/* The evicted keyframe packet must no longer be reachable, while the one
+	 * still buffered resolves through its absolute index. */
+	uint64_t packet_index = 0;
 	struct encoder_packet packet = {0};
-	assert_false(replay_buffer_cache_ref_keyframe_packet(cache, 0, &packet));
-	assert_true(replay_buffer_cache_ref_keyframe_packet(cache, 2, &packet));
+	assert_false(replay_buffer_cache_ref_packet_at(cache, 0, &packet));
+
+	assert_true(replay_buffer_cache_ref_keyframe_at(cache, 1000000, &packet_index, &packet));
 	assert_int_equal(packet.dts_usec, 1000000);
 	obs_encoder_packet_release(&packet);
+
+	/* Walking from that keyframe by absolute index lands on the next packet. */
+	assert_true(replay_buffer_cache_ref_packet_at(cache, packet_index + 1, &packet));
+	assert_int_equal(packet.dts_usec, 1100000);
+	obs_encoder_packet_release(&packet);
+
+	/* An index that was never handed out is rejected. */
+	assert_false(replay_buffer_cache_ref_packet_at(cache, packet_index + 1000, &packet));
 
 	replay_buffer_cache_destroy(cache);
 }
@@ -315,11 +326,17 @@ static void test_range_boundaries_and_clamping(void **state)
 	int64_t actual_start = -1;
 	int64_t actual_end = -1;
 
-	/* Inverted, zero-length, past the newest packet and past the window. */
+	/* Inverted and zero-length intervals resolve to nothing. */
 	assert_false(replay_buffer_cache_resolve_range(cache, 1200000, 1100000, &actual_start, &actual_end));
 	assert_false(replay_buffer_cache_resolve_range(cache, 1200000, 1200000, &actual_start, &actual_end));
-	assert_false(replay_buffer_cache_resolve_range(cache, 2000000, 2500000, &actual_start, &actual_end));
-	assert_false(replay_buffer_cache_resolve_range(cache, 5000000, 6000000, &actual_start, &actual_end));
+
+	/* A start past the newest packet clamps back to the GOP that covers it. */
+	assert_true(replay_buffer_cache_resolve_range(cache, 2000000, 2500000, &actual_start, &actual_end));
+	assert_int_equal(actual_start, 1000000);
+	assert_int_equal(actual_end, 1500000);
+	assert_true(replay_buffer_cache_resolve_range(cache, 5000000, 6000000, &actual_start, &actual_end));
+	assert_int_equal(actual_start, 1000000);
+	assert_int_equal(actual_end, 1500000);
 
 	/* Out-of-window requests clamp to the available range. */
 	assert_true(replay_buffer_cache_resolve_range(cache, -500000, 9000000, &actual_start, &actual_end));
