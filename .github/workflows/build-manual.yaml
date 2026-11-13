@@ -1,4 +1,4 @@
-name: Build (manual)
+name: Build Manual
 run-name: Build (${{ inputs.platforms }}) 🧱
 on:
   workflow_dispatch:

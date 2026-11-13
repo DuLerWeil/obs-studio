@@ -19,9 +19,9 @@ jobs:
     permissions:
       contents: read
 
-  # Builds are not started by branch pushes in this fork: use the manual
-  # "Build (manual)" workflow or the nightly schedule. Tag pushes still build,
-  # because the release jobs below consume the artifacts.
+  # Builds are not started by branch pushes in this fork: use the "Build Manual"
+  # workflow instead. Tag pushes still build, because the release jobs below
+  # consume the artifacts.
   #
   # Build matrix switch: only Windows x64 is built unless the repository
   # variables re-enable the other targets (BUILD_MACOS, BUILD_UBUNTU,
