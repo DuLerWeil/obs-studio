@@ -4,6 +4,7 @@
 
 #include <obs.h>
 #include <util/bmem.h>
+#include <util/dstr.h>
 #include <util/threading.h>
 
 #include <libavcodec/avcodec.h>
@@ -125,6 +126,57 @@ static void decoder_report_failure(struct replay_buffer_decoder *decoder, int co
 	decoder->failures++;
 }
 
+/* Appends every parameter set NAL it finds in an Annex B packet, start code
+ * included, so libavcodec gets the same shape it expects in extradata. */
+static bool append_parameter_sets(enum AVCodecID codec_id, const uint8_t *data, size_t size, struct dstr *out)
+{
+	if (!data || !size)
+		return false;
+
+	size_t i = 0;
+	bool found = false;
+	while (i + 3 < size) {
+		size_t start = 0;
+		if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+			start = i + 3;
+		} else if (i + 4 < size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+			start = i + 4;
+		} else {
+			i++;
+			continue;
+		}
+
+		/* End of this NAL: the next start code, or the end of the packet. */
+		size_t end = size;
+		for (size_t j = start; j + 2 < size; j++) {
+			if (data[j] == 0 && data[j + 1] == 0 &&
+			    (data[j + 2] == 1 || (data[j + 2] == 0 && j + 3 < size && data[j + 3] == 1))) {
+				end = j;
+				break;
+			}
+		}
+		if (end <= start) {
+			i = start;
+			continue;
+		}
+
+		const int nal_type = codec_id == AV_CODEC_ID_HEVC ? (int)((data[start] >> 1) & 0x3F)
+								  : (int)(data[start] & 0x1F);
+		const bool wanted = codec_id == AV_CODEC_ID_HEVC ? (nal_type == 32 || nal_type == 33 || nal_type == 34)
+								 : (nal_type == 7 || nal_type == 8);
+
+		if (wanted) {
+			dstr_ncat(out, "\x00\x00\x00\x01", 4);
+			dstr_ncat(out, (const char *)data + start, end - start);
+			found = true;
+		}
+
+		i = end;
+	}
+
+	return found;
+}
+
 static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct replay_buffer_decoder *decoder)
 {
 	if (decoder->decoder)
@@ -149,7 +201,30 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 
 	uint8_t *extra_data = NULL;
 	size_t extra_size = 0;
-	if (obs_encoder_get_extra_data(frame_decoder->encoder, &extra_data, &extra_size) && extra_data && extra_size) {
+	struct dstr captured = {0};
+
+	if (!obs_encoder_get_extra_data(frame_decoder->encoder, &extra_data, &extra_size) || !extra_data ||
+	    !extra_size) {
+		/* The encoder does not expose the parameter sets, so take them from the
+		 * oldest keyframe in the buffer: encoders only carry them in the first
+		 * keyframe of a session, which is why decoding a later one on its own
+		 * produced nothing. */
+		const enum AVCodecID codec_id = codec_id_from_name(codec_name);
+		const bool an_annex_b_stream = codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_HEVC;
+		struct encoder_packet first;
+		if (an_annex_b_stream && replay_buffer_cache_ref_first_keyframe(frame_decoder->cache, &first)) {
+			if (append_parameter_sets(codec_id, first.data, first.size, &captured)) {
+				extra_data = (uint8_t *)captured.array;
+				extra_size = captured.len;
+				blog(LOG_INFO,
+				     "[replay buffer] using %zu bytes of parameter sets from the first keyframe",
+				     extra_size);
+			}
+			obs_encoder_packet_release(&first);
+		}
+	}
+
+	if (extra_data && extra_size) {
 		context->extradata = av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE);
 		if (context->extradata) {
 			memcpy(context->extradata, extra_data, extra_size);
@@ -157,6 +232,8 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 			decoder->has_extradata = true;
 		}
 	}
+
+	dstr_free(&captured);
 
 	const uint32_t width = obs_encoder_get_width(frame_decoder->encoder);
 	const uint32_t height = obs_encoder_get_height(frame_decoder->encoder);

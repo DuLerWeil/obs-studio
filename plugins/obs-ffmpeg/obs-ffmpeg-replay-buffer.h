@@ -65,6 +65,10 @@ bool replay_buffer_cache_ref_keyframe_packet(replay_buffer_cache_t *cache, uint6
 
 /* Refs the packet with that sequence number, keyframe or not. The caller releases it. */
 bool replay_buffer_cache_ref_packet(replay_buffer_cache_t *cache, uint64_t seq, struct encoder_packet *packet);
+/* Refs the oldest video keyframe still in the cache, which is where the codec
+ * parameter sets live: encoders only repeat them at the very start of the
+ * session, so later keyframes cannot be decoded on their own. */
+bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct encoder_packet *packet);
 
 /* Whole-buffer snapshot used by the save path. */
 replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cache_t *cache);
