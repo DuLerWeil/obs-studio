@@ -1417,8 +1417,10 @@ void OBSReplayBufferPanel::RefreshInfo()
 		return;
 	}
 
-	rangeStartUsec_ = start;
-	rangeEndUsec_ = end;
+	/* The oldest audio packet can sit slightly before zero (priming), and a
+	 * negative start would show up as "-0.033s" on the scale and in the logs. */
+	rangeStartUsec_ = qMax<int64_t>(0, start);
+	rangeEndUsec_ = qMax<int64_t>(rangeStartUsec_, end);
 
 	if (followLive_ || positionUsec_ < rangeStartUsec_ || positionUsec_ > rangeEndUsec_) {
 		positionUsec_ = rangeEndUsec_;
