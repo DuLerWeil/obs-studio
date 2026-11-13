@@ -42,10 +42,7 @@ constexpr int kEdgeMargin = 2;
 constexpr int kLabelGap = 2;
 /* Space between the outer buttons of the timeline row and the panel edge. */
 constexpr int kRowSideMargin = 12;
-/* Shortest gap between two frame requests while the playhead is dragged. The
- * plugin keeps only the newest request, so this is about sparing the decoder,
- * not about queueing. */
-constexpr int kDragFrameIntervalMs = 80;
+
 constexpr int kTrackInset = 2;
 constexpr int kGrooveHeight = 4;
 constexpr int kMarkerHeight = 7;
@@ -1488,12 +1485,14 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	 * plugin keeps only the newest request, so a short throttle is enough to
 	 * keep the decoder from being flooded. */
 	if (finished) {
-		dragFrameElapsed_.invalidate();
 		blog(LOG_INFO, "[replay buffer] review %.3fs", (double)positionUsec_ / 1000000.0);
 		RequestFrame();
-	} else if (!dragFrameElapsed_.isValid() || dragFrameElapsed_.elapsed() >= kDragFrameIntervalMs) {
-		dragFrameElapsed_.start();
-		RequestFrame();
+	} else if (!fullFramePending_) {
+		/* Ask for the next frame as soon as the previous one arrived. The plugin
+		 * keeps only the newest request, so asking again while one was still
+		 * decoding threw that frame away - which is why the picture only caught
+		 * up once the drag stopped. */
+		RequestFrame(false);
 	}
 }
 
@@ -1549,7 +1548,7 @@ void OBSReplayBufferPanel::SnapSelection()
 	exportAction_->setEnabled(!exportRunning_ && Active());
 }
 
-void OBSReplayBufferPanel::RequestFrame()
+void OBSReplayBufferPanel::RequestFrame(bool snap)
 {
 	if (!visible_ || !Active()) {
 		return;
@@ -1569,6 +1568,7 @@ void OBSReplayBufferPanel::RequestFrame()
 	proc_handler_call(ph, "find_replay_keyframe", &query);
 
 	const long long index = calldata_int(&query, "index");
+	const int64_t dts = calldata_int(&query, "dts_usec");
 	calldata_free(&query);
 
 	if (index < 0) {
@@ -1580,7 +1580,21 @@ void OBSReplayBufferPanel::RequestFrame()
 		return;
 	}
 
-	RequestFullFrame(positionUsec_);
+	/* A released click lands on the keyframe whose picture is shown; mid-drag the
+	 * playhead stays under the cursor. */
+	if (snap) {
+		const int64_t snapped = qBound(rangeStartUsec_, dts, rangeEndUsec_);
+		if (snapped != positionUsec_) {
+			positionUsec_ = snapped;
+			followLive_ = snapped >= rangeEndUsec_ - 200000;
+			timeline_->SetPosition(snapped);
+			UpdateLabels();
+			UpdateGoLiveState();
+			UpdateReviewState();
+		}
+	}
+
+	RequestFullFrame(dts);
 }
 
 void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
@@ -1611,6 +1625,7 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 
 	fullFramePending_ = true;
 	pendingFullFrameId_ = requestId;
+
 	blog(LOG_INFO, "[replay buffer] review: decode request %llu queued", (unsigned long long)requestId);
 	fullFrameElapsed_.restart();
 	fullFrameTimer_.start();

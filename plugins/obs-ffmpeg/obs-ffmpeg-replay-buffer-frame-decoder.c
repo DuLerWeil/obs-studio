@@ -242,9 +242,9 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 		context->height = (int)height;
 	}
 
-	/* Scrubbing decodes up to a whole GOP per request, so give the worker a few
-	 * threads; it still runs below the encoder priority. */
-	context->thread_count = 4;
+	/* A keyframe plus a few packets decodes quickly; a couple of threads keeps
+	 * the latency down without competing with the encoder. */
+	context->thread_count = 2;
 
 	const int ret = avcodec_open2(context, codec, NULL);
 	if (ret < 0) {
@@ -324,8 +324,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 			const int ret = avcodec_receive_frame(context, frame);
 			last_receive_ret = ret;
 			if (ret == 0) {
-				/* Keep the newest picture: the playhead may sit anywhere
-				 * between the keyframe and the packet we stopped at. */
 				av_frame_unref(last);
 				av_frame_move_ref(last, frame);
 				have_last = true;
@@ -337,8 +335,11 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 			break;
 		}
 
-		/* A newer request makes the rest of this GOP pointless; drop the work
-		 * instead of finishing a picture nobody will see. */
+		if (have_last)
+			break;
+
+		/* A newer request makes the rest pointless; drop the work instead of
+		 * finishing a picture nobody will see. */
 		if ((i & 15) == 0) {
 			pthread_mutex_lock(&frame_decoder->mutex);
 			const bool superseded = !frame_decoder->stopping && frame_decoder->latest_id != request_id;
@@ -436,7 +437,7 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	/* One GOP plus the packets up to the requested moment: a keyframe alone only
 	 * shows the start of the GOP, and with a four second keyframe interval that
 	 * makes scrubbing look like it does not follow the playhead. */
-	struct encoder_packet packets[300];
+	struct encoder_packet packets[33];
 	size_t count = 0;
 
 	uint64_t keyframe_index = 0;
@@ -444,14 +445,11 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	if (replay_buffer_cache_ref_keyframe_at(frame_decoder->cache, time_usec, &keyframe_index, &keyframe)) {
 		packets[count++] = keyframe;
 
-		uint64_t target_index = keyframe_index;
-		if (!replay_buffer_cache_find_packet(frame_decoder->cache, time_usec, &target_index) ||
-		    target_index < keyframe_index) {
-			target_index = keyframe_index;
-		}
-
+		/* A lone keyframe may not decode when the encoder emits B-frames and an
+		 * open GOP, so take a few video packets after it and keep the first
+		 * picture that comes out. */
 		const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
-		for (uint64_t i = keyframe_index + 1; i <= target_index && count < max_packets; i++) {
+		for (uint64_t i = keyframe_index + 1; count < max_packets; i++) {
 			struct encoder_packet packet;
 			if (!replay_buffer_cache_ref_packet_at(frame_decoder->cache, i, &packet))
 				break;
@@ -460,6 +458,8 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 				continue;
 			}
 			packets[count++] = packet;
+			if (count >= 9)
+				break;
 		}
 	}
 
