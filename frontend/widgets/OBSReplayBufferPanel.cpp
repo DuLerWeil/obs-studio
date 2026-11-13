@@ -987,6 +987,9 @@ void OBSReplayBufferPanel::Start()
 	UpdateCollapsedState();
 	infoTimer_.start();
 	RefreshInfo();
+
+	/* Show the strip even if the first tick had no data yet. */
+	ShowPanel(true);
 }
 
 void OBSReplayBufferPanel::Stop()
@@ -1197,8 +1200,9 @@ void OBSReplayBufferPanel::ShowPanel(bool show)
 {
 	setVisible(show);
 	if (show) {
-		/* The preview row is laid out by now, so the fold button can take its
-		 * final size from the combo next to it. */
+		/* Showing the strip changes its height hint, and the fold button can only
+		 * take its final size once the preview row is laid out. */
+		UpdatePanelHeight();
 		UpdateCollapseButtonSize();
 	}
 	/* The fold button is parented to the preview's own control row, so it has to
@@ -1292,7 +1296,9 @@ void OBSReplayBufferPanel::RefreshInfo()
 	}
 
 	if (!Active()) {
-		HidePanel();
+		/* Stop() takes the panel down. A tick that lands while the output is not
+		 * reported as active yet must keep polling: hiding from here would stop
+		 * the timer and the panel would never appear again. */
 		return;
 	}
 
@@ -1314,7 +1320,16 @@ void OBSReplayBufferPanel::RefreshInfo()
 	calldata_free(&cd);
 
 	if (count <= 0 || end <= start) {
-		ShowPanel(false);
+		/* The buffer is running but has nothing to show yet. Keep an empty scale
+		 * on screen instead of hiding the strip and popping it in later. */
+		rangeStartUsec_ = 0;
+		rangeEndUsec_ = 0;
+		positionUsec_ = 0;
+		timeline_->SetMaxDuration(maxTime);
+		timeline_->SetRange(0, 0);
+		timeline_->SetPosition(0);
+		UpdateControls();
+		ShowPanel(true);
 		SetReviewActive(false);
 		return;
 	}
