@@ -42,6 +42,8 @@ constexpr int kEdgeMargin = 2;
 constexpr int kLabelGap = 2;
 /* Space between the outer buttons of the timeline row and the panel edge. */
 constexpr int kRowSideMargin = 12;
+/* A clip has to be a real span: shorter than this is treated as a mis-click. */
+constexpr int64_t kMinSelectionUsec = 200000;
 /* Vertical breathing room above and below the two rows. Folded away with them,
  * so a collapsed panel takes no space at all. */
 constexpr int kPanelTopMargin = 4;
@@ -651,7 +653,13 @@ void OBSReplayBufferTimeline::mouseReleaseEvent(QMouseEvent *event)
 		emit PositionChanged(position_, true);
 	} else if (draggingSelection_) {
 		draggingSelection_ = false;
-		emit SelectionChanged(selectionStart_, selectionEnd_);
+		if (selectionEnd_ <= selectionStart_) {
+			/* A click without a drag is not a clip. */
+			ClearSelection();
+			emit SelectionChanged(0, 0);
+		} else {
+			emit SelectionChanged(selectionStart_, selectionEnd_);
+		}
 	}
 }
 
@@ -683,18 +691,30 @@ void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 	const int64_t time = TimeAt(event->pos().x());
 
 	/* Left double click: the clip starts here and runs to the current moment.
-	 * Right double click: the clip ends here, keeping the start already set. */
+	 * Right double click: the clip ends here, keeping the start already set. A
+	 * clip always runs forwards, so an end that is not to the right of the start
+	 * is ignored instead of being swapped or invented. */
 	if (event->button() == Qt::LeftButton) {
+		if (rangeEnd_ - time < kMinSelectionUsec) {
+			event->accept();
+			return;
+		}
+
 		selectionStart_ = time;
 		selectionEnd_ = rangeEnd_;
 	} else if (event->button() == Qt::RightButton) {
-		if (selectionEnd_ <= selectionStart_) {
-			selectionStart_ = rangeStart_;
+		if (selectionEnd_ <= selectionStart_ || selectionStart_ <= rangeStart_) {
+			/* No start yet: nothing to end. */
+			event->accept();
+			return;
 		}
+
+		if (time - selectionStart_ < kMinSelectionUsec) {
+			event->accept();
+			return;
+		}
+
 		selectionEnd_ = time;
-		if (selectionEnd_ < selectionStart_) {
-			std::swap(selectionStart_, selectionEnd_);
-		}
 	} else {
 		QWidget::mouseDoubleClickEvent(event);
 		return;
@@ -1267,6 +1287,8 @@ void OBSReplayBufferPanel::HidePanel()
 	CancelFullFrame();
 
 	timeline_->ClearSelection();
+	hasSelection_ = false;
+	selectionEndIsLive_ = false;
 	selectionStartUsec_ = 0;
 	selectionEndUsec_ = 0;
 	exportRunning_ = false;
@@ -1407,10 +1429,21 @@ void OBSReplayBufferPanel::RefreshInfo()
 	timeline_->SetMaxDuration(maxTime);
 	timeline_->SetRange(rangeStartUsec_, rangeEndUsec_);
 	timeline_->SetPosition(positionUsec_);
+	/* A clip that was started without an end runs to the live edge, so it grows
+	 * with the buffer. */
+	if (hasSelection_ && selectionEndIsLive_) {
+		selectionEndUsec_ = rangeEndUsec_;
+		timeline_->SetSelection(selectionStartUsec_, selectionEndUsec_);
+	}
+
 	/* SetRange clamps or clears a selection that fell out of the rolling
 	 * window; keep the values used by the export action in sync. */
 	selectionStartUsec_ = timeline_->SelectionStart();
 	selectionEndUsec_ = timeline_->SelectionEnd();
+	hasSelection_ = timeline_->HasSelection();
+	if (!hasSelection_) {
+		selectionEndIsLive_ = false;
+	}
 
 	UpdateLabels();
 	UpdateControls();
@@ -1445,7 +1478,7 @@ void OBSReplayBufferPanel::UpdateControls()
 	nextButton_->setEnabled(usable);
 	saveButton_->setEnabled(usable);
 	UpdateGoLiveState();
-	exportAction_->setEnabled(usable && timeline_->HasSelection());
+	exportAction_->setEnabled(usable && hasSelection_ && selectionEndUsec_ > selectionStartUsec_);
 }
 
 void OBSReplayBufferPanel::UpdateGoLiveState()
@@ -1514,14 +1547,21 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 void OBSReplayBufferPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
 {
 	if (end_usec <= start_usec) {
+		hasSelection_ = false;
+		selectionEndIsLive_ = false;
 		selectionStartUsec_ = 0;
 		selectionEndUsec_ = 0;
 		exportAction_->setEnabled(false);
 		return;
 	}
 
+	hasSelection_ = true;
 	selectionStartUsec_ = start_usec;
 	selectionEndUsec_ = end_usec;
+	/* A clip that reaches the live edge keeps growing with it, which is what a
+	 * start-only selection means. */
+	selectionEndIsLive_ = end_usec >= rangeEndUsec_ - 1000;
+	exportAction_->setEnabled(false);
 	selectionSettleTimer_.start();
 }
 
@@ -1531,7 +1571,7 @@ void OBSReplayBufferPanel::SnapSelection()
 		return;
 	}
 
-	if (selectionEndUsec_ <= selectionStartUsec_) {
+	if (!hasSelection_ || selectionEndUsec_ <= selectionStartUsec_) {
 		exportAction_->setEnabled(false);
 		return;
 	}
@@ -1544,7 +1584,7 @@ void OBSReplayBufferPanel::SnapSelection()
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "start_usec", selectionStartUsec_);
-	calldata_set_int(&cd, "end_usec", selectionEndUsec_);
+	calldata_set_int(&cd, "end_usec", selectionEndIsLive_ ? rangeEndUsec_ : selectionEndUsec_);
 	proc_handler_call(ph, "snap_replay_selection", &cd);
 
 	const bool valid = calldata_bool(&cd, "valid");
@@ -1559,8 +1599,10 @@ void OBSReplayBufferPanel::SnapSelection()
 
 	selectionStartUsec_ = actualStart;
 	selectionEndUsec_ = actualEnd;
+	hasSelection_ = selectionEndUsec_ > selectionStartUsec_;
+	selectionEndIsLive_ = false;
 	timeline_->SetSelection(selectionStartUsec_, selectionEndUsec_);
-	exportAction_->setEnabled(!exportRunning_ && Active());
+	exportAction_->setEnabled(!exportRunning_ && Active() && hasSelection_);
 }
 
 void OBSReplayBufferPanel::RequestFrame(bool snap)
@@ -1828,7 +1870,12 @@ void OBSReplayBufferPanel::ExportSelection()
 		return;
 	}
 
-	if (selectionEndUsec_ <= selectionStartUsec_) {
+	/* Validate against the buffer as it is now: a clip needs a start, an end to
+	 * the right of it, and both inside the buffered window. */
+	const int64_t selectionStart = selectionStartUsec_;
+	const int64_t selectionEnd = selectionEndIsLive_ ? rangeEndUsec_ : selectionEndUsec_;
+	if (!hasSelection_ || selectionEnd <= selectionStart || selectionStart < rangeStartUsec_ ||
+	    selectionEnd > rangeEndUsec_) {
 		ShowExportError(kExportErrInvalid);
 		return;
 	}
@@ -1841,8 +1888,8 @@ void OBSReplayBufferPanel::ExportSelection()
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 
 	calldata_t cd = {0};
-	calldata_set_int(&cd, "start_usec", selectionStartUsec_);
-	calldata_set_int(&cd, "end_usec", selectionEndUsec_);
+	calldata_set_int(&cd, "start_usec", selectionStart);
+	calldata_set_int(&cd, "end_usec", selectionEnd);
 	proc_handler_call(ph, "export_replay_selection", &cd);
 
 	const int result = (int)calldata_int(&cd, "result");
@@ -1857,6 +1904,8 @@ void OBSReplayBufferPanel::ExportSelection()
 
 	selectionStartUsec_ = actualStart;
 	selectionEndUsec_ = actualEnd;
+	hasSelection_ = selectionEndUsec_ > selectionStartUsec_;
+	selectionEndIsLive_ = false;
 	timeline_->SetSelection(selectionStartUsec_, selectionEndUsec_);
 
 	exportRunning_ = true;

@@ -215,6 +215,10 @@ private:
 	int64_t rangeStartUsec_ = 0;
 	int64_t rangeEndUsec_ = 0;
 	int64_t positionUsec_ = 0;
+	/* A clip is only valid with a start strictly left of its end. */
+	bool hasSelection_ = false;
+	/* Set while the clip has no explicit end and runs to the live edge. */
+	bool selectionEndIsLive_ = false;
 	int64_t selectionStartUsec_ = 0;
 	int64_t selectionEndUsec_ = 0;
 	uint64_t fullFrameRequestId_ = 0;
