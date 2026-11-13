@@ -287,6 +287,9 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t
 
 	if (rgba)
 		bfree(rgba);
+
+	blog(LOG_INFO, "[replay buffer] frame %llu: %s", (unsigned long long)request_id,
+	     decoded ? "decoded" : "failed");
 }
 
 static void *frame_thread(void *param)
@@ -312,6 +315,8 @@ static void *frame_thread(void *param)
 		frame_decoder->has_request = false;
 		pthread_mutex_unlock(&frame_decoder->mutex);
 
+		blog(LOG_INFO, "[replay buffer] frame %llu: decoding seq %llu", (unsigned long long)request_id,
+		     (unsigned long long)seq);
 		frame_process(frame_decoder, seq, request_id);
 	}
 

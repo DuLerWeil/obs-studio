@@ -1098,6 +1098,7 @@ void OBSReplayBufferPanel::SetReviewFrame(const QImage &image)
 	reviewActive_ = true;
 	reviewClear_ = false;
 	reviewPending_ = frame;
+	blog(LOG_INFO, "[replay buffer] review: stored %dx%d frame", frame.width(), frame.height());
 }
 
 void OBSReplayBufferPanel::ClearReviewFrame()
@@ -1611,6 +1612,7 @@ void OBSReplayBufferPanel::RequestFullFrame(uint64_t seq)
 
 	fullFramePending_ = true;
 	pendingFullFrameId_ = requestId;
+	blog(LOG_INFO, "[replay buffer] review: decode request %llu queued", (unsigned long long)requestId);
 	fullFrameElapsed_.restart();
 	fullFrameTimer_.start();
 }
@@ -1655,10 +1657,13 @@ void OBSReplayBufferPanel::PollFullFrame()
 
 	if (status == kFullFramePending) {
 		if (fullFrameElapsed_.elapsed() > 3000) {
+			blog(LOG_INFO, "[replay buffer] review: decode timed out");
 			CancelFullFrame();
 		}
 		return;
 	}
+
+	blog(LOG_INFO, "[replay buffer] review: copy status %d %dx%d (%lld bytes)", status, width, height, size);
 
 	fullFrameTimer_.stop();
 	fullFramePending_ = false;
