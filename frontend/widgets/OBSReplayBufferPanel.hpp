@@ -140,6 +140,7 @@ private slots:
 	void PositionChanged(qint64 position_usec, bool finished);
 	void SelectionChanged(qint64 start_usec, qint64 end_usec);
 	void PollFullFrame();
+	void ToggleLivePause();
 	void GoLive();
 	void PreviousKeyframe();
 	void NextKeyframe();

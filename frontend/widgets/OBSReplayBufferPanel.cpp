@@ -814,8 +814,10 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	nextButton_ = makeButton(ThemeIcon("media/media_next.svg"),
 				 QTStr("Basic.Main.Preview.ReplayBuffer.NextKeyframe"), navIconSize);
 
-	goLiveButton_ = makeButton(ThemeIcon("media/media_restart.svg"),
-				   QTStr("Basic.Main.Preview.ReplayBuffer.GoLiveHint"), navIconSize);
+	/* Two states: pause the live view where it is, or jump back to the newest
+	 * frame; UpdateGoLiveState() picks the glyph and the tooltip. */
+	goLiveButton_ = makeButton(ThemeIcon("media/media_pause.svg"),
+				   QTStr("Basic.Main.Preview.ReplayBuffer.PauseLive"), navIconSize);
 
 	/* Two explicit buttons replace the old options menu: exporting the whole
 	 * buffer and exporting the marked clip. Their icons share the save arrow and
@@ -882,7 +884,7 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	connect(timeline_, &OBSReplayBufferTimeline::PositionChanged, this, &OBSReplayBufferPanel::PositionChanged);
 	connect(timeline_, &OBSReplayBufferTimeline::SelectionChanged, this, &OBSReplayBufferPanel::SelectionChanged);
 	connect(timeline_, &OBSReplayBufferTimeline::GoLiveRequested, this, &OBSReplayBufferPanel::GoLive);
-	connect(goLiveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::GoLive);
+	connect(goLiveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::ToggleLivePause);
 	connect(prevButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::PreviousKeyframe);
 	connect(nextButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::NextKeyframe);
 
@@ -1410,13 +1412,41 @@ void OBSReplayBufferPanel::UpdateControls()
 	prevButton_->setEnabled(usable);
 	nextButton_->setEnabled(usable);
 	saveButton_->setEnabled(usable);
-	goLiveButton_->setEnabled(usable && positionUsec_ < rangeEndUsec_ - 200000);
+	UpdateGoLiveState();
 	exportAction_->setEnabled(usable && timeline_->HasSelection());
 }
 
 void OBSReplayBufferPanel::UpdateGoLiveState()
 {
-	goLiveButton_->setEnabled(Active() && !exportRunning_ && positionUsec_ < rangeEndUsec_ - 200000);
+	const bool usable = Active() && !exportRunning_;
+	const bool parked = Reviewing();
+
+	goLiveButton_->setEnabled(usable);
+	goLiveButton_->setIcon(ThemeIcon(parked ? "media/media_play.svg" : "media/media_pause.svg"));
+	goLiveButton_->setToolTip(QTStr(parked ? "Basic.Main.Preview.ReplayBuffer.GoLiveHint"
+					       : "Basic.Main.Preview.ReplayBuffer.PauseLive"));
+}
+
+void OBSReplayBufferPanel::ToggleLivePause()
+{
+	if (!Active() || exportRunning_) {
+		return;
+	}
+
+	if (Reviewing()) {
+		GoLive();
+		return;
+	}
+
+	/* Park a moment behind the live edge so the frozen frame is actually shown:
+	 * right at rangeEnd the program preview still owns the canvas. */
+	followLive_ = false;
+	positionUsec_ = qMax(rangeStartUsec_, rangeEndUsec_ - 500000);
+	timeline_->SetPosition(positionUsec_);
+	UpdateLabels();
+	UpdateGoLiveState();
+	UpdateReviewState();
+	RequestFrame();
 }
 
 void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
