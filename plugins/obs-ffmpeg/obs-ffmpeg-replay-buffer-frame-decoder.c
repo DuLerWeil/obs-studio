@@ -11,6 +11,7 @@
 #include <libavutil/mem.h>
 #include <libswscale/swscale.h>
 
+#include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
@@ -54,19 +55,55 @@ struct replay_buffer_frame_decoder {
 	struct replay_buffer_decoder decoder;
 };
 
+/* Encoders report their codec with whatever spelling they like - Quartz reports
+ * "h264", the QSV plugin reports "H.264" - so compare without case and accept
+ * the usual aliases. */
 static enum AVCodecID codec_id_from_name(const char *codec)
 {
 	if (!codec)
 		return AV_CODEC_ID_NONE;
 
-	if (strcmp(codec, "h264") == 0)
+	char lower[32];
+	size_t len = strlen(codec);
+	if (len >= sizeof(lower))
+		len = sizeof(lower) - 1;
+	for (size_t i = 0; i < len; i++)
+		lower[i] = (char)tolower((unsigned char)codec[i]);
+	lower[len] = 0;
+
+	if (strcmp(lower, "h264") == 0 || strcmp(lower, "h.264") == 0 || strcmp(lower, "avc") == 0 ||
+	    strcmp(lower, "avc1") == 0)
 		return AV_CODEC_ID_H264;
-	if (strcmp(codec, "hevc") == 0 || strcmp(codec, "h265") == 0)
+	if (strcmp(lower, "hevc") == 0 || strcmp(lower, "h265") == 0 || strcmp(lower, "h.265") == 0 ||
+	    strcmp(lower, "hev1") == 0 || strcmp(lower, "hvc1") == 0)
 		return AV_CODEC_ID_HEVC;
-	if (strcmp(codec, "av1") == 0)
+	if (strcmp(lower, "av1") == 0 || strcmp(lower, "av01") == 0)
 		return AV_CODEC_ID_AV1;
+	if (strcmp(lower, "prores") == 0)
+		return AV_CODEC_ID_PRORES;
+	if (strcmp(lower, "vp9") == 0)
+		return AV_CODEC_ID_VP9;
+	if (strcmp(lower, "vp8") == 0)
+		return AV_CODEC_ID_VP8;
 
 	return AV_CODEC_ID_NONE;
+}
+
+/* Everything OBS can hand the replay buffer decodes through libavcodec, so the
+ * known names are mapped explicitly and anything else is looked up by name. */
+static const AVCodec *find_decoder_for_codec(const char *codec_name)
+{
+	if (!codec_name || !*codec_name)
+		return NULL;
+
+	const enum AVCodecID codec_id = codec_id_from_name(codec_name);
+	if (codec_id != AV_CODEC_ID_NONE) {
+		const AVCodec *codec = avcodec_find_decoder(codec_id);
+		if (codec)
+			return codec;
+	}
+
+	return avcodec_find_decoder_by_name(codec_name);
 }
 
 static void decoder_thread_set_low_priority(void)
@@ -96,8 +133,7 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 		return false;
 
 	const char *codec_name = obs_encoder_get_codec(frame_decoder->encoder);
-	const enum AVCodecID codec_id = codec_id_from_name(codec_name);
-	const AVCodec *codec = codec_id == AV_CODEC_ID_NONE ? NULL : avcodec_find_decoder(codec_id);
+	const AVCodec *codec = find_decoder_for_codec(codec_name);
 	if (!codec) {
 		blog(LOG_WARNING, "[replay buffer] no keyframe decoder for codec '%s'",
 		     codec_name ? codec_name : "(null)");
@@ -448,15 +484,9 @@ replay_buffer_frame_decoder_t *replay_buffer_frame_decoder_create(obs_encoder_t 
 		return NULL;
 
 	const char *codec_name = obs_encoder_get_codec(video_encoder);
-	const enum AVCodecID codec_id = codec_id_from_name(codec_name);
-	if (codec_id == AV_CODEC_ID_NONE) {
-		blog(LOG_DEBUG, "[replay buffer] frame preview disabled for codec '%s'",
+	if (!find_decoder_for_codec(codec_name)) {
+		blog(LOG_WARNING, "[replay buffer] decoder for codec '%s' is not available",
 		     codec_name ? codec_name : "(null)");
-		return NULL;
-	}
-
-	if (!avcodec_find_decoder(codec_id)) {
-		blog(LOG_WARNING, "[replay buffer] decoder for codec '%s' is not available", codec_name);
 		return NULL;
 	}
 
