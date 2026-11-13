@@ -7,6 +7,7 @@
 #include <qt-wrappers.hpp>
 
 #include <QAction>
+#include <QApplication>
 #include <QEvent>
 #include <QFont>
 #include <QFontMetrics>
@@ -110,6 +111,11 @@ QIcon ThemeIcon(const char *name)
 	QIcon icon(QStringLiteral("theme:") + dir + file);
 	if (icon.isNull()) {
 		icon = QIcon(QStringLiteral(":/res/images/") + file);
+	}
+	/* A third-party theme may ship neither, and an icon button without an icon
+	 * would collapse to nothing. */
+	if (icon.isNull()) {
+		icon = QApplication::style()->standardIcon(QStyle::SP_FileIcon);
 	}
 	return icon;
 }
@@ -800,16 +806,15 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 		return button;
 	};
 
-	const auto standardIcon = [this](QStyle::StandardPixmap pixmap) {
-		return style()->standardIcon(pixmap);
-	};
-
-	prevButton_ = makeButton(standardIcon(QStyle::SP_MediaSeekBackward),
+	/* One icon family for the whole strip: the theme's own media glyphs, so the
+	 * steps, the saves and "go live" share stroke weight and corner rounding
+	 * instead of mixing Qt's filled pixmaps with outline SVGs. */
+	prevButton_ = makeButton(ThemeIcon("media/media_previous.svg"),
 				 QTStr("Basic.Main.Preview.ReplayBuffer.PreviousKeyframe"), navIconSize);
-	nextButton_ = makeButton(standardIcon(QStyle::SP_MediaSeekForward),
+	nextButton_ = makeButton(ThemeIcon("media/media_next.svg"),
 				 QTStr("Basic.Main.Preview.ReplayBuffer.NextKeyframe"), navIconSize);
 
-	goLiveButton_ = makeButton(standardIcon(QStyle::SP_MediaSkipForward),
+	goLiveButton_ = makeButton(ThemeIcon("media/media_restart.svg"),
 				   QTStr("Basic.Main.Preview.ReplayBuffer.GoLiveHint"), navIconSize);
 
 	/* Two explicit buttons replace the old options menu: saving the whole buffer
@@ -930,7 +935,7 @@ void OBSReplayBufferPanel::UpdateCollapseButtonSize()
 
 void OBSReplayBufferPanel::ApplyCollapseIcon()
 {
-	const QIcon base = style()->standardIcon(collapsed_ ? QStyle::SP_ArrowUp : QStyle::SP_ArrowDown);
+	const QIcon base = ThemeIcon(collapsed_ ? "up.svg" : "down.svg");
 	collapseButton_->setIconSize(QSize(collapseIconSide_, collapseIconSide_));
 	collapseButton_->setIcon(QIcon(base.pixmap(QSize(collapseIconSide_, collapseIconSide_))));
 }
