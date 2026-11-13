@@ -919,6 +919,10 @@ void OBSReplayBufferPanel::UpdateCollapseButtonSize()
 	}
 
 	const int side = qBound(14, height - 8, 34);
+	if (collapseButton_->width() == side && collapseButton_->height() == side) {
+		return;
+	}
+
 	collapseIconSide_ = qMax(8, side - 4);
 	collapseButton_->setFixedSize(side, side);
 	ApplyCollapseIcon();
@@ -997,7 +1001,9 @@ void OBSReplayBufferPanel::Start()
 	RefreshInfo();
 
 	/* Show the strip even if the first tick had no data yet. */
-	ShowPanel(true);
+	if (Active()) {
+		ShowPanel(true);
+	}
 }
 
 void OBSReplayBufferPanel::Stop()
@@ -1210,8 +1216,9 @@ void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 
 void OBSReplayBufferPanel::ShowPanel(bool show)
 {
+	const bool changed = isHidden() == show;
 	setVisible(show);
-	if (show) {
+	if (show && changed) {
 		/* Showing the strip changes its height hint, and the fold button can only
 		 * take its final size once the preview row is laid out. */
 		UpdatePanelHeight();
@@ -1308,9 +1315,12 @@ void OBSReplayBufferPanel::RefreshInfo()
 	}
 
 	if (!Active()) {
-		/* Stop() takes the panel down. A tick that lands while the output is not
-		 * reported as active yet must keep polling: hiding from here would stop
-		 * the timer and the panel would never appear again. */
+		/* Keep the timer polling: hiding through HidePanel() from here would stop
+		 * it, and a tick that landed before the output reported itself active used
+		 * to take the panel down for the rest of the session. The strip is hidden
+		 * without touching the timers so nothing stale stays on screen. */
+		ShowPanel(false);
+		SetReviewActive(false);
 		return;
 	}
 
