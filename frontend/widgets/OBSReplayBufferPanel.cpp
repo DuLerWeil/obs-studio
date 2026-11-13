@@ -847,19 +847,20 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 
 	timeline_ = new OBSReplayBufferTimeline(this);
 
-	/* Everything sits on the timeline row: the keyframe steps at the far left,
-	 * the scale in the middle and the save actions plus "go live" on the right. */
+	/* The scale takes the whole left side and every control is grouped at the
+	 * right end: keyframe steps, live pause/resume, export the marked clip,
+	 * export the whole buffer. */
 	auto *timelineRow = new QHBoxLayout;
 	/* Keep the outer icons off the window edge; the scale fills what is left. */
 	timelineRow->setContentsMargins(kRowSideMargin, 0, kRowSideMargin, 0);
 	timelineRow->setSpacing(4);
-	timelineRow->addWidget(prevButton_);
-	timelineRow->addWidget(nextButton_);
 	timelineRow->addWidget(timeline_, 1);
 	timelineRow->addWidget(cacheLabel_);
-	timelineRow->addWidget(saveButton_);
-	timelineRow->addWidget(exportButton_);
+	timelineRow->addWidget(prevButton_);
+	timelineRow->addWidget(nextButton_);
 	timelineRow->addWidget(goLiveButton_);
+	timelineRow->addWidget(exportButton_);
+	timelineRow->addWidget(saveButton_);
 
 	auto *layout = new QVBoxLayout(this);
 	/* No side margins: the panel is docked directly under the preview column
