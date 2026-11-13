@@ -703,17 +703,16 @@ void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 		selectionStart_ = time;
 		selectionEnd_ = rangeEnd_;
 	} else if (event->button() == Qt::RightButton) {
-		if (selectionEnd_ <= selectionStart_ || selectionStart_ <= rangeStart_) {
-			/* No start yet: nothing to end. */
+		/* Setting the end before the start is a normal way to work, so a clip
+		 * that has no start yet begins at the oldest buffered moment. */
+		int64_t start = selectionEnd_ > selectionStart_ ? selectionStart_ : rangeStart_;
+
+		if (time - start < kMinSelectionUsec) {
 			event->accept();
 			return;
 		}
 
-		if (time - selectionStart_ < kMinSelectionUsec) {
-			event->accept();
-			return;
-		}
-
+		selectionStart_ = start;
 		selectionEnd_ = time;
 	} else {
 		QWidget::mouseDoubleClickEvent(event);
@@ -1557,6 +1556,9 @@ void OBSReplayBufferPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
 		return;
 	}
 
+	blog(LOG_INFO, "[replay buffer] selection %.3fs - %.3fs (range %.3fs - %.3fs)", (double)start_usec / 1000000.0,
+	     (double)end_usec / 1000000.0, (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
+
 	hasSelection_ = true;
 	selectionStartUsec_ = start_usec;
 	selectionEndUsec_ = end_usec;
@@ -1593,6 +1595,9 @@ void OBSReplayBufferPanel::SnapSelection()
 	const int64_t actualStart = calldata_int(&cd, "actual_start_usec");
 	const int64_t actualEnd = calldata_int(&cd, "actual_end_usec");
 	calldata_free(&cd);
+
+	blog(LOG_INFO, "[replay buffer] snap: valid %d, %.3fs - %.3fs", valid, (double)actualStart / 1000000.0,
+	     (double)actualEnd / 1000000.0);
 
 	if (!valid || actualEnd <= actualStart) {
 		exportAction_->setEnabled(false);
@@ -1876,6 +1881,10 @@ void OBSReplayBufferPanel::ExportSelection()
 	 * the right of it, and both inside the buffered window. */
 	const int64_t selectionStart = selectionStartUsec_;
 	const int64_t selectionEnd = selectionEndIsLive_ ? rangeEndUsec_ : selectionEndUsec_;
+	blog(LOG_INFO, "[replay buffer] export: %.3fs - %.3fs (has selection %d, live end %d, range %.3fs - %.3fs)",
+	     (double)selectionStart / 1000000.0, (double)selectionEnd / 1000000.0, hasSelection_, selectionEndIsLive_,
+	     (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
+
 	if (!hasSelection_ || selectionEnd <= selectionStart || selectionStart < rangeStartUsec_ ||
 	    selectionEnd > rangeEndUsec_) {
 		ShowExportError(kExportErrInvalid);
@@ -1898,6 +1907,9 @@ void OBSReplayBufferPanel::ExportSelection()
 	const int64_t actualStart = calldata_int(&cd, "actual_start_usec");
 	const int64_t actualEnd = calldata_int(&cd, "actual_end_usec");
 	calldata_free(&cd);
+
+	blog(LOG_INFO, "[replay buffer] export result %d (%.3fs - %.3fs)", result, (double)actualStart / 1000000.0,
+	     (double)actualEnd / 1000000.0);
 
 	if (result != kExportErrNone) {
 		ShowExportError(result);

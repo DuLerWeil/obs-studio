@@ -1168,6 +1168,8 @@ static void export_replay_selection(void *data, calldata_t *cd)
 		result = REPLAY_EXPORT_ERR_INVALID;
 	} else if (!replay_buffer_cache_resolve_range(stream->replay_cache, start_usec, end_usec, &actual_start,
 						      &actual_end)) {
+		blog(LOG_WARNING, "[replay buffer] export: %.3fs - %.3fs does not resolve to a range",
+		     (double)start_usec / 1000000.0, (double)end_usec / 1000000.0);
 		result = REPLAY_EXPORT_ERR_INVALID;
 	} else if (!replay_buffer_begin_mux(stream)) {
 		result = REPLAY_EXPORT_ERR_BUSY;
@@ -1181,6 +1183,8 @@ static void export_replay_selection(void *data, calldata_t *cd)
 		} else {
 			stream->selection_export = true;
 			replay_buffer_prepare_packets(stream, snapshot);
+			blog(LOG_INFO, "[replay buffer] export: %zu packets for %.3fs - %.3fs", stream->mux_packets.num,
+			     (double)actual_start / 1000000.0, (double)actual_end / 1000000.0);
 			replay_buffer_snapshot_release(snapshot);
 
 			/* Write to a temporary file first so a failed export never
