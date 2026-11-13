@@ -89,6 +89,13 @@ static void ffmpeg_mux_destroy(void *data)
 {
 	struct ffmpeg_muxer *stream = data;
 
+	/* A save or a selection export may still be writing. Join it before any of
+	 * the state it reads (the packet list, the paths, the mutexes) goes away. */
+	if (stream->mux_thread_joinable) {
+		pthread_join(stream->mux_thread, NULL);
+		stream->mux_thread_joinable = false;
+	}
+
 	replay_buffer_clear(stream);
 	replay_buffer_cache_destroy(stream->replay_cache);
 	stream->replay_cache = NULL;
@@ -96,8 +103,6 @@ static void ffmpeg_mux_destroy(void *data)
 		pthread_mutex_destroy(&stream->replay_buffer_mutex);
 		stream->replay_buffer_mutex_initialized = false;
 	}
-	if (stream->mux_thread_joinable)
-		pthread_join(stream->mux_thread, NULL);
 	for (size_t i = 0; i < stream->mux_packets.num; i++)
 		obs_encoder_packet_release(&stream->mux_packets.array[i]);
 	da_free(stream->mux_packets);

@@ -920,6 +920,12 @@ OBSReplayBufferPanel::~OBSReplayBufferPanel()
 		obs_leave_graphics();
 		reviewTexture_ = nullptr;
 	}
+
+	/* The fold button is parented to the preview's control row, so it would
+	 * outlive the panel it drives; take it down with us. */
+	if (collapseButton_ && collapseButton_->parent() != this) {
+		collapseButton_->deleteLater();
+	}
 }
 
 void OBSReplayBufferPanel::resizeEvent(QResizeEvent *event)

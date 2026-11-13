@@ -282,7 +282,17 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 			cache_purge_gop(cache);
 	}
 
-	if (!cache_packet_count(cache)) {
+	if (!da_push_back(cache->packets, &stored)) {
+		/* Out of memory: drop the reference instead of leaking it, and leave
+		 * next_seq alone so it keeps matching the packet index. */
+		obs_encoder_packet_release(&stored);
+		pthread_mutex_unlock(&cache->mutex);
+		return;
+	}
+
+	const uint64_t seq = cache->next_seq++;
+
+	if (cache_packet_count(cache) == 1) {
 		cache->first_dts_usec = packet->dts_usec;
 		cache->last_dts_usec = packet->dts_usec;
 	} else if (packet->dts_usec > cache->last_dts_usec) {
@@ -290,9 +300,6 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 	}
 
 	cache->total_size += (int64_t)packet->size;
-
-	const uint64_t seq = cache->next_seq++;
-	da_push_back(cache->packets, &stored);
 
 	if (packet->type == OBS_ENCODER_VIDEO && packet->keyframe) {
 		cache->video_keyframe_count++;
@@ -582,7 +589,12 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
 
 			struct encoder_packet ref;
 			obs_encoder_packet_ref(&ref, packet);
-			da_push_back(snapshot->packets, &ref);
+			if (!da_push_back(snapshot->packets, &ref)) {
+				obs_encoder_packet_release(&ref);
+				pthread_mutex_unlock(&cache->mutex);
+				replay_buffer_snapshot_release(snapshot);
+				return NULL;
+			}
 		}
 	}
 
@@ -640,7 +652,14 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cach
 	for (size_t i = 0; i < count; i++) {
 		struct encoder_packet packet;
 		obs_encoder_packet_ref(&packet, &cache->packets.array[cache->packets_head + i]);
-		da_push_back(snapshot->packets, &packet);
+		if (!da_push_back(snapshot->packets, &packet)) {
+			/* Out of memory: release what was taken and report failure
+			 * instead of handing out a truncated snapshot. */
+			obs_encoder_packet_release(&packet);
+			pthread_mutex_unlock(&cache->mutex);
+			replay_buffer_snapshot_release(snapshot);
+			return NULL;
+		}
 	}
 
 	pthread_mutex_unlock(&cache->mutex);
