@@ -19,10 +19,10 @@ replay_buffer_frame_decoder_t *replay_buffer_frame_decoder_create(obs_encoder_t 
  * NULL. */
 void replay_buffer_frame_decoder_destroy(replay_buffer_frame_decoder_t *frame_decoder);
 
-/* Queues a full-resolution decode of the keyframe identified by seq. The worker
- * keeps only the newest request: a later request_id supersedes an older one and
- * the older result is discarded. request_id must be non-zero. Returns false when
- * the worker is stopping. */
+/* Queues a full-resolution decode of the keyframe closest to time_usec. The
+ * worker keeps only the newest request: a later request_id supersedes an older
+ * one and the older result is discarded. request_id must be non-zero. Returns
+ * false when the worker is stopping. */
 bool replay_buffer_frame_decoder_request(replay_buffer_frame_decoder_t *frame_decoder, int64_t time_usec,
 					 uint64_t request_id);
 

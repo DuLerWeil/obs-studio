@@ -409,9 +409,9 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	uint32_t height = 0;
 	bool decoded = false;
 
-	/* Resolve the packet by walking the buffer, not by sequence number: the
-	 * index and the packet array can disagree, and a keyframe sequence then named
-	 * an audio packet, which is not decodable at all. */
+	/* Resolve the keyframe by time: the cache maps the timestamp to the GOP that
+	 * covers it and hands back that packet's absolute index, so the packets that
+	 * follow can be walked without any sequence bookkeeping. */
 	uint64_t index = 0;
 	size_t count = 0;
 	struct encoder_packet packets[33];
