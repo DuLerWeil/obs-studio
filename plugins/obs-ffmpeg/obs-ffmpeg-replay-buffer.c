@@ -59,18 +59,18 @@ static size_t cache_gop_count(const replay_buffer_cache_t *cache)
 	return cache->gops.num - cache->gops_head;
 }
 
-static struct replay_buffer_gop *cache_gop_at(const replay_buffer_cache_t *cache, size_t index)
+static struct replay_buffer_gop *cache_gop_at(replay_buffer_cache_t *cache, size_t index)
 {
 	return &cache->gops.array[cache->gops_head + index];
 }
 
-static struct replay_buffer_packet *cache_slot_at(const replay_buffer_cache_t *cache, size_t offset)
+static struct replay_buffer_packet *cache_slot_at(replay_buffer_cache_t *cache, size_t offset)
 {
 	return &cache->slots[(cache->head + offset) % cache->capacity];
 }
 
 /* Maps an absolute index to its slot and checks the slot really holds it. */
-static struct replay_buffer_packet *cache_slot_for_index(const replay_buffer_cache_t *cache, uint64_t index)
+static struct replay_buffer_packet *cache_slot_for_index(replay_buffer_cache_t *cache, uint64_t index)
 {
 	if (index < cache->first_index)
 		return NULL;
@@ -446,7 +446,7 @@ static bool cache_resolve_range_locked(replay_buffer_cache_t *cache, int64_t sta
 	uint64_t last = gop->first_index;
 
 	for (uint64_t index = gop->first_index;; index++) {
-		const struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+		struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
 		if (!slot)
 			break;
 		if (slot->packet.dts_usec > end_usec)
@@ -513,7 +513,7 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
 
 	if (found) {
 		for (uint64_t index = first; index <= last; index++) {
-			const struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+			struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
 			if (!slot)
 				break;
 
@@ -552,8 +552,7 @@ bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct
 	pthread_mutex_lock(&cache->mutex);
 
 	if (cache_gop_count(cache) > 0) {
-		const struct replay_buffer_packet *slot =
-			cache_slot_for_index(cache, cache_gop_at(cache, 0)->first_index);
+		struct replay_buffer_packet *slot = cache_slot_for_index(cache, cache_gop_at(cache, 0)->first_index);
 		if (slot) {
 			obs_encoder_packet_ref(packet, &slot->packet);
 			found = true;
@@ -587,8 +586,7 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 			best = before <= after ? low - 1 : low;
 		}
 
-		const struct replay_buffer_packet *slot =
-			cache_slot_for_index(cache, cache->gops.array[best].first_index);
+		struct replay_buffer_packet *slot = cache_slot_for_index(cache, cache->gops.array[best].first_index);
 		if (slot && slot->packet.type == OBS_ENCODER_VIDEO && slot->packet.keyframe) {
 			obs_encoder_packet_ref(packet, &slot->packet);
 			*index = slot->index;
@@ -614,7 +612,7 @@ bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t in
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	const struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+	struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
 	if (slot) {
 		obs_encoder_packet_ref(packet, &slot->packet);
 		found = true;
