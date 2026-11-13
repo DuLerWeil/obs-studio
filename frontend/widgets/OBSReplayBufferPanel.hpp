@@ -125,7 +125,7 @@ public:
 	/* Hands the fold button to the preview's own control row, so it sits next to
 	 * the horizontal scroll bar instead of the playback row. When a reference
 	 * widget is given, the button takes the size of its drop-down arrow. */
-	void SetCollapseButtonLayout(QLayout *layout, const QWidget *reference = nullptr);
+	void SetCollapseButtonLayout(QLayout *layout, QWidget *reference = nullptr);
 
 public slots:
 	void Start();

@@ -887,7 +887,7 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	ShowPanel(false);
 }
 
-void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, const QWidget *reference)
+void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, QWidget *reference)
 {
 	if (!layout || !collapseButton_) {
 		return;
