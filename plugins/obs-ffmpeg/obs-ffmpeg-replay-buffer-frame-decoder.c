@@ -432,6 +432,21 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t
 			decoder_decode(frame_decoder, &frame_decoder->decoder, packets, count, &rgba, &width, &height);
 		for (size_t i = 0; i < count; i++)
 			obs_encoder_packet_release(&packets[i]);
+	} else {
+		/* Nothing was taken from the cache: either the sequence number is gone or
+		 * it does not point at a video keyframe. Say which, because those two have
+		 * very different fixes. */
+		struct encoder_packet probe;
+		if (replay_buffer_cache_ref_packet(frame_decoder->cache, seq, &probe)) {
+			blog(LOG_INFO,
+			     "[replay buffer] frame %llu: seq %llu is not a video keyframe (type %d, keyframe %d)",
+			     (unsigned long long)request_id, (unsigned long long)seq, (int)probe.type,
+			     probe.keyframe ? 1 : 0);
+			obs_encoder_packet_release(&probe);
+		} else {
+			blog(LOG_INFO, "[replay buffer] frame %llu: no packet in the cache for seq %llu",
+			     (unsigned long long)request_id, (unsigned long long)seq);
+		}
 	}
 
 	pthread_mutex_lock(&frame_decoder->mutex);
