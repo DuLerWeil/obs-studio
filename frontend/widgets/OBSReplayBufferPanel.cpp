@@ -1023,8 +1023,11 @@ void OBSReplayBufferPanel::UpdateReviewState()
 	const bool reviewing = Reviewing();
 
 	/* Attach lazily so this callback is registered after the one that draws
-	 * the live preview, which makes the reviewed frame land on top of it. */
-	if (reviewing && !reviewDisplay_) {
+	 * the live preview, which makes the reviewed frame land on top of it. It is
+	 * re-checked every time because the preview recreates its display when the
+	 * window moves between monitors or the scaling mode changes, and the old
+	 * callback list dies with it. */
+	if (reviewing) {
 		AttachReviewDisplay(preview_);
 	}
 
@@ -1146,6 +1149,7 @@ void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 		const uint8_t *data = pending.constBits();
 		reviewTexture_ =
 			gs_texture_create((uint32_t)pending.width(), (uint32_t)pending.height(), GS_RGBA, 1, &data, 0);
+		blog(LOG_INFO, "[replay buffer] review: uploaded %dx%d frame", pending.width(), pending.height());
 	}
 
 	if (!reviewTexture_ || !cx || !cy) {
@@ -1507,11 +1511,16 @@ void OBSReplayBufferPanel::RequestFrame()
 	}
 
 	if (seq < 0) {
+		blog(LOG_INFO, "[replay buffer] review %.3fs: no keyframe at this position",
+		     (double)positionUsec_ / 1000000.0);
 		/* Nothing decodable at this position; drop the stale frame so the
 		 * canvas falls back to the live picture. */
 		ClearReviewFrame();
 		return;
 	}
+
+	blog(LOG_INFO, "[replay buffer] review %.3fs: keyframe %lld (seq %lld)", (double)positionUsec_ / 1000000.0,
+	     index, seq);
 
 	/* Snap the playhead to the keyframe that will actually be shown, so the
 	 * position label, the canvas and the previous/next keyframe actions all
@@ -1550,6 +1559,7 @@ void OBSReplayBufferPanel::RequestFullFrame(uint64_t seq)
 	calldata_free(&cd);
 
 	if (!accepted) {
+		blog(LOG_INFO, "[replay buffer] review: the decoder refused the request");
 		return;
 	}
 
@@ -1627,6 +1637,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_free(&copy);
 
 	if (copyStatus != kFullFrameReady || copied <= 0) {
+		blog(LOG_INFO, "[replay buffer] review: copy returned status %d (%lld bytes)", copyStatus, copied);
 		return;
 	}
 
