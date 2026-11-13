@@ -324,10 +324,11 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t
 	uint32_t height = 0;
 	bool decoded = false;
 
-	/* Feed the requested keyframe plus a few packets after it: encoders with
-	 * B-frames may not output that first frame until they see more input, and a
-	 * keyframe alone then decodes to nothing. */
-	struct encoder_packet packets[9];
+	/* Feed the requested keyframe plus the packets after it: with B-frames and an
+	 * open GOP (NVENC emits CRA frames) the decoder may not output anything until
+	 * it has seen a good part of the GOP, and a lone keyframe then decodes to
+	 * nothing. */
+	struct encoder_packet packets[33];
 	size_t count = 0;
 	const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
 	for (size_t i = 0; i < max_packets; i++) {
@@ -367,8 +368,8 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t
 	if (rgba)
 		bfree(rgba);
 
-	blog(LOG_INFO, "[replay buffer] frame %llu: %s", (unsigned long long)request_id,
-	     decoded ? "decoded" : "failed");
+	blog(LOG_INFO, "[replay buffer] frame %llu: %s (%zu packets)", (unsigned long long)request_id,
+	     decoded ? "decoded" : "failed", count);
 }
 
 static void *frame_thread(void *param)
