@@ -1696,6 +1696,8 @@ void OBSReplayBufferPanel::PollFullFrame()
 	 * edge; at the live edge the program preview is already correct. */
 	if (Reviewing()) {
 		SetReviewFrame(image);
+	} else {
+		blog(LOG_INFO, "[replay buffer] review: frame ready but the panel is not reviewing");
 	}
 }
 
