@@ -242,9 +242,9 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 		context->height = (int)height;
 	}
 
-	/* Keep one decoding thread: the worker runs below the encoder priority and
-	 * must not compete with the recording encoder. */
-	context->thread_count = 1;
+	/* Scrubbing decodes up to a whole GOP per request, so give the worker a few
+	 * threads; it still runs below the encoder priority. */
+	context->thread_count = 4;
 
 	const int ret = avcodec_open2(context, codec, NULL);
 	if (ret < 0) {
@@ -261,8 +261,8 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 }
 
 static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct replay_buffer_decoder *decoder,
-			   const struct encoder_packet *packets, size_t count, uint8_t **out_rgba, uint32_t *out_width,
-			   uint32_t *out_height)
+			   const struct encoder_packet *packets, size_t count, uint64_t request_id, uint8_t **out_rgba,
+			   uint32_t *out_width, uint32_t *out_height)
 {
 	if (!packets || !count)
 		return false;
@@ -279,13 +279,18 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	avcodec_flush_buffers(context);
 
 	AVFrame *frame = av_frame_alloc();
-	if (!frame)
+	AVFrame *last = av_frame_alloc();
+	if (!frame || !last) {
+		av_frame_free(&frame);
+		av_frame_free(&last);
 		return false;
+	}
 
-	bool got_frame = false;
+	bool have_last = false;
 	int last_send_ret = 0;
 	int last_receive_ret = 0;
-	for (size_t i = 0; i < count && !got_frame; i++) {
+
+	for (size_t i = 0; i < count; i++) {
 		if (!packets[i].data || !packets[i].size || packets[i].size > (size_t)INT_MAX)
 			break;
 
@@ -319,7 +324,11 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 			const int ret = avcodec_receive_frame(context, frame);
 			last_receive_ret = ret;
 			if (ret == 0) {
-				got_frame = true;
+				/* Keep the newest picture: the playhead may sit anywhere
+				 * between the keyframe and the packet we stopped at. */
+				av_frame_unref(last);
+				av_frame_move_ref(last, frame);
+				have_last = true;
 				break;
 			}
 			if (ret == AVERROR(EAGAIN))
@@ -327,29 +336,41 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 			decoder_report_failure(decoder, ret);
 			break;
 		}
+
+		/* A newer request makes the rest of this GOP pointless; drop the work
+		 * instead of finishing a picture nobody will see. */
+		if ((i & 15) == 0) {
+			pthread_mutex_lock(&frame_decoder->mutex);
+			const bool superseded = !frame_decoder->stopping && frame_decoder->latest_id != request_id;
+			pthread_mutex_unlock(&frame_decoder->mutex);
+			if (superseded)
+				break;
+		}
 	}
 
-	if (!got_frame) {
+	if (!have_last) {
 		/* Drain: some streams only output the first frame once the decoder is
 		 * told there is no more input. */
 		avcodec_send_packet(context, NULL);
 
 		for (;;) {
 			const int ret = avcodec_receive_frame(context, frame);
+			last_receive_ret = ret;
 			if (ret == 0) {
-				got_frame = true;
-				break;
+				av_frame_unref(last);
+				av_frame_move_ref(last, frame);
+				have_last = true;
 			}
-			if (ret == AVERROR(EAGAIN))
-				break;
 			break;
 		}
 	}
 
-	if (!got_frame) {
+	av_frame_free(&frame);
+
+	if (!have_last) {
 		blog(LOG_INFO, "[replay buffer] decode: no frame from %zu packets (last send %d, last receive %d)",
 		     count, last_send_ret, last_receive_ret);
-		av_frame_free(&frame);
+		av_frame_free(&last);
 		/* Some encoders only expose extradata after the first packet. If it
 		 * was missing, allow the next keyframe to reopen the decoder with the
 		 * now-available extradata. */
@@ -358,39 +379,39 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 		return false;
 	}
 
-	const int width = frame->width;
-	const int height = frame->height;
+	const int width = last->width;
+	const int height = last->height;
 	if (width <= 0 || height <= 0) {
-		av_frame_free(&frame);
+		av_frame_free(&last);
 		return false;
 	}
 
 	const size_t row_size = (size_t)width * 4;
 	if ((size_t)height > SIZE_MAX / row_size) {
-		av_frame_free(&frame);
+		av_frame_free(&last);
 		return false;
 	}
 
-	decoder->scaler = sws_getCachedContext(decoder->scaler, frame->width, frame->height,
-					       (enum AVPixelFormat)frame->format, width, height, AV_PIX_FMT_RGBA,
+	decoder->scaler = sws_getCachedContext(decoder->scaler, last->width, last->height,
+					       (enum AVPixelFormat)last->format, width, height, AV_PIX_FMT_RGBA,
 					       SWS_BILINEAR, NULL, NULL, NULL);
 	if (!decoder->scaler) {
-		av_frame_free(&frame);
+		av_frame_free(&last);
 		return false;
 	}
 
 	const size_t size = row_size * (size_t)height;
 	uint8_t *rgba = bmalloc(size);
 	if (!rgba) {
-		av_frame_free(&frame);
+		av_frame_free(&last);
 		return false;
 	}
 
 	uint8_t *dst_data[4] = {rgba, NULL, NULL, NULL};
 	int dst_linesize[4] = {(int)row_size, 0, 0, 0};
-	const int scaled = sws_scale(decoder->scaler, (const uint8_t *const *)frame->data, frame->linesize, 0,
-				     frame->height, dst_data, dst_linesize);
-	av_frame_free(&frame);
+	const int scaled = sws_scale(decoder->scaler, (const uint8_t *const *)last->data, last->linesize, 0,
+				     last->height, dst_data, dst_linesize);
+	av_frame_free(&last);
 
 	if (scaled <= 0) {
 		bfree(rgba);
@@ -412,19 +433,25 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	/* Resolve the keyframe by time: the cache maps the timestamp to the GOP that
 	 * covers it and hands back that packet's absolute index, so the packets that
 	 * follow can be walked without any sequence bookkeeping. */
-	uint64_t index = 0;
+	/* One GOP plus the packets up to the requested moment: a keyframe alone only
+	 * shows the start of the GOP, and with a four second keyframe interval that
+	 * makes scrubbing look like it does not follow the playhead. */
+	struct encoder_packet packets[300];
 	size_t count = 0;
-	struct encoder_packet packets[33];
 
+	uint64_t keyframe_index = 0;
 	struct encoder_packet keyframe;
-	if (replay_buffer_cache_ref_keyframe_at(frame_decoder->cache, time_usec, &index, &keyframe)) {
+	if (replay_buffer_cache_ref_keyframe_at(frame_decoder->cache, time_usec, &keyframe_index, &keyframe)) {
 		packets[count++] = keyframe;
 
-		/* Encoders with B-frames (and an open GOP) may not output the keyframe
-		 * until they have seen more input, so take the video packets that
-		 * follow it as well. */
+		uint64_t target_index = keyframe_index;
+		if (!replay_buffer_cache_find_packet(frame_decoder->cache, time_usec, &target_index) ||
+		    target_index < keyframe_index) {
+			target_index = keyframe_index;
+		}
+
 		const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
-		for (uint64_t i = index + 1; i < index + 64 && count < max_packets; i++) {
+		for (uint64_t i = keyframe_index + 1; i <= target_index && count < max_packets; i++) {
 			struct encoder_packet packet;
 			if (!replay_buffer_cache_ref_packet_at(frame_decoder->cache, i, &packet))
 				break;
@@ -437,8 +464,8 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	}
 
 	if (count) {
-		decoded =
-			decoder_decode(frame_decoder, &frame_decoder->decoder, packets, count, &rgba, &width, &height);
+		decoded = decoder_decode(frame_decoder, &frame_decoder->decoder, packets, count, request_id, &rgba,
+					 &width, &height);
 		for (size_t i = 0; i < count; i++)
 			obs_encoder_packet_release(&packets[i]);
 	} else {

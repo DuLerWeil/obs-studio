@@ -1489,12 +1489,11 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	 * keep the decoder from being flooded. */
 	if (finished) {
 		dragFrameElapsed_.invalidate();
+		blog(LOG_INFO, "[replay buffer] review %.3fs", (double)positionUsec_ / 1000000.0);
 		RequestFrame();
 	} else if (!dragFrameElapsed_.isValid() || dragFrameElapsed_.elapsed() >= kDragFrameIntervalMs) {
 		dragFrameElapsed_.start();
-		/* Snapping the playhead to a keyframe mid-drag would yank it out from
-		 * under the cursor, so only the release snaps. */
-		RequestFrame(false);
+		RequestFrame();
 	}
 }
 
@@ -1550,7 +1549,7 @@ void OBSReplayBufferPanel::SnapSelection()
 	exportAction_->setEnabled(!exportRunning_ && Active());
 }
 
-void OBSReplayBufferPanel::RequestFrame(bool snap)
+void OBSReplayBufferPanel::RequestFrame()
 {
 	if (!visible_ || !Active()) {
 		return;
@@ -1563,47 +1562,27 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 
-	/* The keyframe index is the only place that knows which packet belongs to
-	 * the requested time; resolve it there and decode that packet. */
+	/* The cache answers with the frame under the playhead; this lookup only tells
+	 * whether the moment is still inside a GOP at all. */
 	calldata_t query = {0};
 	calldata_set_int(&query, "time_usec", positionUsec_);
 	proc_handler_call(ph, "find_replay_keyframe", &query);
 
 	const long long index = calldata_int(&query, "index");
-	const int64_t dts = calldata_int(&query, "dts_usec");
 	calldata_free(&query);
 
 	if (index < 0) {
-		if (snap) {
-			blog(LOG_INFO, "[replay buffer] review %.3fs: no keyframe at this position",
-			     (double)positionUsec_ / 1000000.0);
-		}
+		blog(LOG_DEBUG, "[replay buffer] review %.3fs: no keyframe at this position",
+		     (double)positionUsec_ / 1000000.0);
 		/* Nothing decodable at this position; drop the stale frame so the
 		 * canvas falls back to the live picture. */
 		ClearReviewFrame();
 		return;
 	}
 
-	if (snap) {
-		blog(LOG_INFO, "[replay buffer] review %.3fs: keyframe %lld at %.3fs",
-		     (double)positionUsec_ / 1000000.0, index, (double)dts / 1000000.0);
-	}
-
-	/* Snap the playhead to the keyframe that will actually be shown, so the
-	 * position label, the canvas and the previous/next keyframe actions all
-	 * refer to the same frame. */
-	const int64_t snapped = qBound(rangeStartUsec_, dts, rangeEndUsec_);
-	if (snap && snapped != positionUsec_) {
-		positionUsec_ = snapped;
-		followLive_ = snapped >= rangeEndUsec_ - 200000;
-		timeline_->SetPosition(snapped);
-		UpdateLabels();
-		UpdateGoLiveState();
-		UpdateReviewState();
-	}
-
-	RequestFullFrame(dts);
+	RequestFullFrame(positionUsec_);
 }
+
 void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 {
 	if (!visible_ || !Active()) {

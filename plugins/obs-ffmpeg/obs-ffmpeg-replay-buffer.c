@@ -622,6 +622,51 @@ bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t in
 	return found;
 }
 
+bool replay_buffer_cache_find_packet(replay_buffer_cache_t *cache, int64_t time_usec, uint64_t *index)
+{
+	if (!cache || !index)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&cache->mutex);
+
+	if (cache->count > 0) {
+		/* Absolute indices follow the buffer order, so a binary search over them
+		 * finds the packet closest to the requested time. */
+		uint64_t low = cache->first_index;
+		uint64_t high = cache->first_index + cache->count - 1;
+
+		while (low < high) {
+			const uint64_t middle = low + (high - low) / 2;
+			struct replay_buffer_packet *slot = cache_slot_for_index(cache, middle);
+			if (!slot)
+				break;
+			if (slot->packet.dts_usec < time_usec)
+				low = middle + 1;
+			else
+				high = middle;
+		}
+
+		struct replay_buffer_packet *slot = cache_slot_for_index(cache, low);
+		if (!slot) {
+			pthread_mutex_unlock(&cache->mutex);
+			return false;
+		}
+
+		if (low > cache->first_index && slot->packet.dts_usec > time_usec) {
+			struct replay_buffer_packet *prev = cache_slot_for_index(cache, low - 1);
+			if (prev && time_usec - prev->packet.dts_usec < slot->packet.dts_usec - time_usec)
+				low--;
+		}
+
+		*index = low;
+		found = true;
+	}
+
+	pthread_mutex_unlock(&cache->mutex);
+	return found;
+}
+
 replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cache_t *cache)
 {
 	if (!cache)
