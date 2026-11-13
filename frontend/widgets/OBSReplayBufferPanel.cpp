@@ -1575,10 +1575,27 @@ void OBSReplayBufferPanel::SnapSelection()
 		return;
 	}
 
-	if (!hasSelection_ || selectionEndUsec_ <= selectionStartUsec_) {
+	/* Same source of truth as the export: the values the timeline is showing. A
+	 * clip that has been partially rolled out is clamped to what is left rather
+	 * than declared invalid. */
+	int64_t selectionStart = 0;
+	int64_t selectionEnd = 0;
+
+	if (timeline_->HasSelection()) {
+		selectionStart = qBound(rangeStartUsec_, timeline_->SelectionStart(), rangeEndUsec_);
+		selectionEnd = selectionEndIsLive_ ? rangeEndUsec_
+						   : qBound(rangeStartUsec_, timeline_->SelectionEnd(), rangeEndUsec_);
+	}
+
+	if (selectionEnd <= selectionStart) {
+		hasSelection_ = false;
 		exportAction_->setEnabled(false);
 		return;
 	}
+
+	hasSelection_ = true;
+	selectionStartUsec_ = selectionStart;
+	selectionEndUsec_ = selectionEnd;
 
 	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
 	if (!output) {
@@ -1587,8 +1604,8 @@ void OBSReplayBufferPanel::SnapSelection()
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	calldata_t cd = {0};
-	calldata_set_int(&cd, "start_usec", selectionStartUsec_);
-	calldata_set_int(&cd, "end_usec", selectionEndIsLive_ ? rangeEndUsec_ : selectionEndUsec_);
+	calldata_set_int(&cd, "start_usec", selectionStart);
+	calldata_set_int(&cd, "end_usec", selectionEnd);
 	proc_handler_call(ph, "snap_replay_selection", &cd);
 
 	const bool valid = calldata_bool(&cd, "valid");
@@ -1877,16 +1894,32 @@ void OBSReplayBufferPanel::ExportSelection()
 		return;
 	}
 
-	/* Validate against the buffer as it is now: a clip needs a start, an end to
-	 * the right of it, and both inside the buffered window. */
-	const int64_t selectionStart = selectionStartUsec_;
-	const int64_t selectionEnd = selectionEndIsLive_ ? rangeEndUsec_ : selectionEndUsec_;
-	blog(LOG_INFO, "[replay buffer] export: %.3fs - %.3fs (has selection %d, live end %d, range %.3fs - %.3fs)",
-	     (double)selectionStart / 1000000.0, (double)selectionEnd / 1000000.0, hasSelection_, selectionEndIsLive_,
-	     (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
+	/* The timeline is the source of truth: it is what the user sees, and its
+	 * values are already clamped to the buffered window. Re-read it here instead
+	 * of trusting the cached copy, which could lag behind by a refresh and reject
+	 * a clip that is plainly visible. */
+	int64_t selectionStart = 0;
+	int64_t selectionEnd = 0;
 
-	if (!hasSelection_ || selectionEnd <= selectionStart || selectionStart < rangeStartUsec_ ||
-	    selectionEnd > rangeEndUsec_) {
+	if (timeline_->HasSelection()) {
+		selectionStart = qBound(rangeStartUsec_, timeline_->SelectionStart(), rangeEndUsec_);
+		selectionEnd = qBound(rangeStartUsec_, timeline_->SelectionEnd(), rangeEndUsec_);
+		if (selectionEndIsLive_) {
+			selectionEnd = rangeEndUsec_;
+		}
+	}
+
+	hasSelection_ = selectionEnd > selectionStart;
+	selectionStartUsec_ = selectionStart;
+	selectionEndUsec_ = selectionEnd;
+
+	blog(LOG_INFO,
+	     "[replay buffer] export: %.3fs - %.3fs (timeline %d, has selection %d, live end %d, range %.3fs - %.3fs)",
+	     (double)selectionStart / 1000000.0, (double)selectionEnd / 1000000.0, timeline_->HasSelection(),
+	     hasSelection_, selectionEndIsLive_, (double)rangeStartUsec_ / 1000000.0,
+	     (double)rangeEndUsec_ / 1000000.0);
+
+	if (!hasSelection_) {
 		ShowExportError(kExportErrInvalid);
 		return;
 	}
