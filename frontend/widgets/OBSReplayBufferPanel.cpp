@@ -920,7 +920,7 @@ void OBSReplayBufferPanel::ApplyCollapseIcon()
 {
 	const QIcon base = style()->standardIcon(collapsed_ ? QStyle::SP_ArrowUp : QStyle::SP_ArrowDown);
 	collapseButton_->setIconSize(QSize(collapseIconSide_, collapseIconSide_));
-	collapseButton_->setIcon(QIcon(base.pixmap(collapseIconSide_, collapseIconSide_)));
+	collapseButton_->setIcon(QIcon(base.pixmap(QSize(collapseIconSide_, collapseIconSide_))));
 }
 
 OBSReplayBufferPanel::~OBSReplayBufferPanel()
