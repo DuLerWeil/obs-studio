@@ -178,6 +178,8 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 	}
 
 	decoder->decoder = context;
+	blog(LOG_INFO, "[replay buffer] decoder opened: codec '%s', extradata %d bytes, %dx%d",
+	     codec_name ? codec_name : "(null)", context->extradata_size, context->width, context->height);
 	return true;
 }
 
@@ -204,6 +206,8 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 		return false;
 
 	bool got_frame = false;
+	int last_send_ret = 0;
+	int last_receive_ret = 0;
 	for (size_t i = 0; i < count && !got_frame; i++) {
 		if (!packets[i].data || !packets[i].size || packets[i].size > (size_t)INT_MAX)
 			break;
@@ -226,6 +230,7 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 			av_packet->flags |= AV_PKT_FLAG_KEY;
 
 		const int send_ret = avcodec_send_packet(context, av_packet);
+		last_send_ret = send_ret;
 		av_packet_free(&av_packet);
 
 		if (send_ret < 0) {
@@ -235,6 +240,7 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 
 		for (;;) {
 			const int ret = avcodec_receive_frame(context, frame);
+			last_receive_ret = ret;
 			if (ret == 0) {
 				got_frame = true;
 				break;
@@ -264,6 +270,8 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	}
 
 	if (!got_frame) {
+		blog(LOG_INFO, "[replay buffer] decode: no frame from %zu packets (last send %d, last receive %d)",
+		     count, last_send_ret, last_receive_ret);
 		av_frame_free(&frame);
 		/* Some encoders only expose extradata after the first packet. If it
 		 * was missing, allow the next keyframe to reopen the decoder with the
