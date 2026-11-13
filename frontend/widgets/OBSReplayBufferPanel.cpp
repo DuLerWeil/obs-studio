@@ -2,6 +2,7 @@
 
 #include "OBSBasic.hpp"
 
+#include <obs-frontend-api.h>
 #include <obs.hpp>
 #include <qt-wrappers.hpp>
 
@@ -10,6 +11,7 @@
 #include <QFont>
 #include <QFontMetrics>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLayout>
 #include <QMessageBox>
@@ -19,7 +21,6 @@
 #include <QPolygonF>
 #include <QSize>
 #include <QStyle>
-#include <QStyleOptionComboBox>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -38,6 +39,8 @@ constexpr int kPanelSpacing = 4;
  * never clipped when the UI is scaled up. */
 constexpr int kEdgeMargin = 2;
 constexpr int kLabelGap = 2;
+/* Space between the outer buttons of the timeline row and the panel edge. */
+constexpr int kRowSideMargin = 12;
 constexpr int kTrackInset = 2;
 constexpr int kGrooveHeight = 4;
 constexpr int kMarkerHeight = 7;
@@ -95,6 +98,20 @@ QString FormatOffset(int64_t usec)
 	}
 
 	return usec == 0 ? FormatTime(0) : QStringLiteral("-%1").arg(FormatTime(usec));
+}
+
+/* Icon from the active theme, falling back to the built-in resources when the
+ * theme does not ship that file. */
+QIcon ThemeIcon(const char *name)
+{
+	const QString file = QLatin1String(name);
+	const QString dir = obs_frontend_is_theme_dark() ? QStringLiteral("Dark/") : QStringLiteral("Light/");
+
+	QIcon icon(QStringLiteral("theme:") + dir + file);
+	if (icon.isNull()) {
+		icon = QIcon(QStringLiteral(":/res/images/") + file);
+	}
+	return icon;
 }
 
 /* Type of the scale: the ruler labels and the marker readouts share it, so the
@@ -769,45 +786,50 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	UpdateSecondaryTextColors();
 
 	const int iconSize = style()->pixelMetric(QStyle::PM_SmallIconSize);
-	/* The navigation row is secondary, so its icons stay one step smaller than
-	 * the menu and collapse buttons. */
+	/* The row sits under the preview, so its icons stay one step smaller than the
+	 * preview's own controls. */
 	const int navIconSize = qMax(10, iconSize - 4);
 
-	auto makeButton = [this](QStyle::StandardPixmap icon, const QString &tooltip, int size) {
+	auto makeButton = [this](const QIcon &icon, const QString &tooltip, int size) {
 		QToolButton *button = new QToolButton(this);
 		button->setAutoRaise(true);
 		button->setFocusPolicy(Qt::NoFocus);
 		button->setIconSize(QSize(size, size));
-		button->setIcon(style()->standardIcon(icon));
+		button->setIcon(icon);
 		button->setToolTip(tooltip);
 		return button;
 	};
 
-	prevButton_ = makeButton(QStyle::SP_MediaSeekBackward,
-				 QTStr("Basic.Main.Preview.ReplayBuffer.PreviousKeyframe"), navIconSize);
-	nextButton_ = makeButton(QStyle::SP_MediaSeekForward, QTStr("Basic.Main.Preview.ReplayBuffer.NextKeyframe"),
-				 navIconSize);
+	const auto standardIcon = [this](QStyle::StandardPixmap pixmap) {
+		return style()->standardIcon(pixmap);
+	};
 
-	goLiveButton_ = makeButton(QStyle::SP_MediaSkipForward, QTStr("Basic.Main.Preview.ReplayBuffer.GoLiveHint"),
-				   navIconSize);
+	prevButton_ = makeButton(standardIcon(QStyle::SP_MediaSeekBackward),
+				 QTStr("Basic.Main.Preview.ReplayBuffer.PreviousKeyframe"), navIconSize);
+	nextButton_ = makeButton(standardIcon(QStyle::SP_MediaSeekForward),
+				 QTStr("Basic.Main.Preview.ReplayBuffer.NextKeyframe"), navIconSize);
+
+	goLiveButton_ = makeButton(standardIcon(QStyle::SP_MediaSkipForward),
+				   QTStr("Basic.Main.Preview.ReplayBuffer.GoLiveHint"), navIconSize);
 
 	/* Two explicit buttons replace the old options menu: saving the whole buffer
-	 * and exporting the marked clip are different enough to be separate. */
-	saveButton_ = new QToolButton(this);
-	saveButton_->setAutoRaise(true);
-	saveButton_->setFocusPolicy(Qt::NoFocus);
-	saveButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
-	saveButton_->setText(QTStr("Basic.Main.SaveReplay"));
+	 * and exporting the marked clip are different enough to be separate. They
+	 * use icons so the row stays on one line next to the scale. */
+	saveButton_ = makeButton(ThemeIcon("save.svg"), QTStr("Basic.Main.SaveReplay"), navIconSize);
 	connect(saveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::SaveReplay);
 
 	exportAction_ = new QAction(QTStr("Basic.Main.Preview.ReplayBuffer.ExportSelection"), this);
 	exportAction_->setEnabled(false);
+	exportAction_->setIcon(ThemeIcon("popout.svg"));
+	/* Icon-only, so the action text doubles as the tooltip. */
+	exportAction_->setToolTip(exportAction_->text());
 	connect(exportAction_, &QAction::triggered, this, &OBSReplayBufferPanel::ExportSelection);
 
 	exportButton_ = new QToolButton(this);
 	exportButton_->setAutoRaise(true);
 	exportButton_->setFocusPolicy(Qt::NoFocus);
-	exportButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+	exportButton_->setIconSize(QSize(navIconSize, navIconSize));
+	exportButton_->setToolButtonStyle(Qt::ToolButtonIconOnly);
 	exportButton_->setDefaultAction(exportAction_);
 
 	collapseButton_ = new QToolButton(this);
@@ -821,7 +843,8 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	/* Everything sits on the timeline row: the keyframe steps at the far left,
 	 * the scale in the middle and the save actions plus "go live" on the right. */
 	auto *timelineRow = new QHBoxLayout;
-	timelineRow->setContentsMargins(0, 0, 0, 0);
+	/* Keep the outer icons off the window edge; the scale fills what is left. */
+	timelineRow->setContentsMargins(kRowSideMargin, 0, kRowSideMargin, 0);
 	timelineRow->setSpacing(4);
 	timelineRow->addWidget(prevButton_);
 	timelineRow->addWidget(nextButton_);
@@ -872,27 +895,32 @@ void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, const QWidge
 
 	layout->addWidget(collapseButton_);
 
-	if (!reference) {
+	foldReference_ = reference;
+	UpdateCollapseButtonSize();
+}
+
+void OBSReplayBufferPanel::UpdateCollapseButtonSize()
+{
+	if (!collapseButton_) {
 		return;
 	}
 
-	/* Take the size of the drop-down arrow next to it, so the fold control reads
-	 * as part of the same strip instead of a bigger, separate button. */
-	QStyleOptionComboBox option;
-	option.initFrom(reference);
-	option.subControls = QStyle::SC_ComboBoxArrow;
-	const QRect arrow =
-		reference->style()->subControlRect(QStyle::CC_ComboBox, &option, QStyle::SC_ComboBoxArrow, reference);
-	if (arrow.isEmpty()) {
-		return;
-	}
+	/* Match the combo's drop-down button: a square of the control height minus
+	 * its padding, with a pre-scaled glyph so the style sheet's icon-size cannot
+	 * blow it up again. Called again once the window is laid out, because the
+	 * reference still has its designer size while the ctor runs. */
+	const int height = foldReference_ ? foldReference_->height() : 0;
+	const int side = qMax(14, height - 8);
+	collapseIconSide_ = qMax(8, side - 4);
+	collapseButton_->setFixedSize(side, side);
+	ApplyCollapseIcon();
+}
 
-	/* Match the combo's drop-down button, so the two controls are the same size
-	 * and the fold button does not tower over the zoom row. */
-	const QSize box = arrow.size();
-	const int iconSide = qMax(8, qMin(box.width(), box.height()) - 6);
-	collapseButton_->setFixedSize(box);
-	collapseButton_->setIconSize(QSize(iconSide, iconSide));
+void OBSReplayBufferPanel::ApplyCollapseIcon()
+{
+	const QIcon base = style()->standardIcon(collapsed_ ? QStyle::SP_ArrowUp : QStyle::SP_ArrowDown);
+	collapseButton_->setIconSize(QSize(collapseIconSide_, collapseIconSide_));
+	collapseButton_->setIcon(QIcon(base.pixmap(collapseIconSide_, collapseIconSide_)));
 }
 
 OBSReplayBufferPanel::~OBSReplayBufferPanel()
@@ -1168,6 +1196,11 @@ void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 void OBSReplayBufferPanel::ShowPanel(bool show)
 {
 	setVisible(show);
+	if (show) {
+		/* The preview row is laid out by now, so the fold button can take its
+		 * final size from the combo next to it. */
+		UpdateCollapseButtonSize();
+	}
 	/* The fold button is parented to the preview's own control row, so it has to
 	 * follow the panel explicitly instead of being hidden along with it. */
 	collapseButton_->setVisible(show);
@@ -1222,9 +1255,9 @@ void OBSReplayBufferPanel::UpdateCompactness()
 
 void OBSReplayBufferPanel::UpdateCollapsedState()
 {
-	collapseButton_->setIcon(style()->standardIcon(collapsed_ ? QStyle::SP_ArrowUp : QStyle::SP_ArrowDown));
 	collapseButton_->setToolTip(QTStr(collapsed_ ? "Basic.Main.Preview.ReplayBuffer.Expand"
 						     : "Basic.Main.Preview.ReplayBuffer.Collapse"));
+	ApplyCollapseIcon();
 
 	timeline_->setVisible(!collapsed_);
 	prevButton_->setVisible(!collapsed_);

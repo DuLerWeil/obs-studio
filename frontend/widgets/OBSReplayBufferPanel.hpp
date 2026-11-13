@@ -152,6 +152,9 @@ private:
 	bool Active() const;
 	bool Reviewing() const;
 	void ShowPanel(bool show);
+	/* Rebuild the fold chevron at the size the control row can hold. */
+	void ApplyCollapseIcon();
+	void UpdateCollapseButtonSize();
 	void HidePanel();
 	void UpdatePanelHeight();
 	void UpdateCompactness();
@@ -186,6 +189,9 @@ private:
 	QToolButton *goLiveButton_;
 	QToolButton *collapseButton_;
 	QAction *exportAction_;
+	/* Glyph size picked for the fold button when it joins the preview row. */
+	int collapseIconSide_ = 12;
+	QPointer<QWidget> foldReference_;
 	OBSReplayBufferTimeline *timeline_ = nullptr;
 
 	/* The reviewed frame is uploaded as a texture on the graphics thread and
