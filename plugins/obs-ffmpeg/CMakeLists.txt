@@ -36,6 +36,10 @@ target_sources(
     obs-ffmpeg-mux.h
     obs-ffmpeg-output.c
     obs-ffmpeg-output.h
+    obs-ffmpeg-replay-buffer.c
+    obs-ffmpeg-replay-buffer.h
+    obs-ffmpeg-replay-buffer-frame-decoder.c
+    obs-ffmpeg-replay-buffer-frame-decoder.h
     obs-ffmpeg-source.c
     obs-ffmpeg-video-encoders.c
     obs-ffmpeg.c
