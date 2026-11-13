@@ -697,21 +697,56 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	/* Walk the packets themselves instead of going through the keyframe index:
-	 * the index stores sequence numbers, and a sequence that no longer lines up
-	 * with the array handed the decoder an audio packet. */
-	int64_t best_delta = 0;
-	for (size_t i = cache->packets_head; i < cache->packets.num; i++) {
-		const struct encoder_packet *candidate = &cache->packets.array[i];
-		if (candidate->type != OBS_ENCODER_VIDEO || !candidate->keyframe)
-			continue;
+	/* Fast path: the keyframe index is sorted by dts, so binary search it and
+	 * translate the sequence number into an array offset. Only when that offset
+	 * does not land on the video keyframe does the code fall back to walking the
+	 * buffer - a sequence that stopped lining up with the array used to hand the
+	 * decoder an audio packet. */
+	if (cache_keyframe_count(cache) > 0) {
+		size_t low = cache->keyframes_head;
+		size_t high = cache->keyframes.num;
+		while (low < high) {
+			const size_t middle = low + (high - low) / 2;
+			if (cache->keyframes.array[middle].dts_usec < time_usec)
+				low = middle + 1;
+			else
+				high = middle;
+		}
+		if (low >= cache->keyframes.num)
+			low = cache->keyframes.num - 1;
 
-		const int64_t delta = candidate->dts_usec > time_usec ? candidate->dts_usec - time_usec
-								      : time_usec - candidate->dts_usec;
-		if (!found || delta < best_delta) {
-			best_delta = delta;
-			*index = i;
-			found = true;
+		const uint64_t seq = cache->keyframes.array[low].seq;
+		if (seq >= cache->first_seq) {
+			const uint64_t offset = seq - cache->first_seq;
+			if (offset < cache_packet_count(cache)) {
+				const size_t candidate = cache->packets_head + (size_t)offset;
+				const struct encoder_packet *at = &cache->packets.array[candidate];
+				if (at->type == OBS_ENCODER_VIDEO && at->keyframe) {
+					*index = candidate;
+					found = true;
+				} else {
+					blog(LOG_WARNING,
+					     "[replay buffer] keyframe index disagrees with the packets (seq %llu is type %d), scanning",
+					     (unsigned long long)seq, (int)at->type);
+				}
+			}
+		}
+	}
+
+	if (!found) {
+		int64_t best_delta = 0;
+		for (size_t i = cache->packets_head; i < cache->packets.num; i++) {
+			const struct encoder_packet *candidate = &cache->packets.array[i];
+			if (candidate->type != OBS_ENCODER_VIDEO || !candidate->keyframe)
+				continue;
+
+			const int64_t delta = candidate->dts_usec > time_usec ? candidate->dts_usec - time_usec
+									      : time_usec - candidate->dts_usec;
+			if (!found || delta < best_delta) {
+				best_delta = delta;
+				*index = i;
+				found = true;
+			}
 		}
 	}
 
