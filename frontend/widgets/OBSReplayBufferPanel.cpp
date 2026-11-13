@@ -380,12 +380,17 @@ void OBSReplayBufferTimeline::SetFrozen(bool frozen)
 	}
 
 	if (frozen) {
-		frozenEnd_ = LiveAxisEnd();
-		frozenSpan_ = FullAxisSpan() + AxisLead() * 2;
+		/* Pin whatever is on screen: entering review must not throw the view
+		 * back to the whole buffer. */
+		frozenEnd_ = AxisEnd();
+		frozenSpan_ = AxisSpan();
 	} else {
-		/* Back to the live window, without a leftover zoom. */
-		zoomSpan_ = 0;
-		axisEnd_ = LiveAxisEnd();
+		/* Carry the window that was shown while parked back to the live view.
+		 * Zooming or panning is a timeline operation, so only "go live" - which
+		 * calls ResetZoom() first - drops it. */
+		const int64_t full = FullAxisSpan() + AxisLead() * 2;
+		zoomSpan_ = frozenSpan_ > 0 && frozenSpan_ < full ? frozenSpan_ : 0;
+		axisEnd_ = zoomSpan_ > 0 ? qBound(rangeStart_, frozenEnd_, LiveAxisEnd()) : LiveAxisEnd();
 	}
 
 	frozen_ = frozen;
@@ -406,10 +411,15 @@ void OBSReplayBufferTimeline::SetRange(int64_t start_usec, int64_t end_usec)
 		/* Re-align once the ruler has slid through the whole margin, and let go
 		 * when the parked moment has been rolled out of the buffer. */
 		if (frozenEnd_ <= start_usec) {
+			const int64_t full = FullAxisSpan() + AxisLead() * 2;
+			zoomSpan_ = frozenSpan_ > 0 && frozenSpan_ < full ? frozenSpan_ : 0;
+			axisEnd_ = zoomSpan_ > 0 ? qBound(start_usec, frozenEnd_, LiveAxisEnd()) : LiveAxisEnd();
 			frozen_ = false;
-		} else if (end_usec - frozenEnd_ >= frozenSpan_ / 10) {
+		} else if (end_usec - frozenEnd_ >= qMax<int64_t>(FullAxisSpan() / 10, 1000000)) {
+			/* Slide the window along, keeping the zoom it was shown with. The
+			 * step follows the whole buffer, not the zoomed slice, so a zoomed
+			 * parked view does not shuffle every fraction of a second. */
 			frozenEnd_ = end_usec + AxisLead();
-			frozenSpan_ = FullAxisSpan() + AxisLead() * 2;
 		}
 	}
 
@@ -758,6 +768,10 @@ void OBSReplayBufferTimeline::ResetZoom()
 	const bool changed = zoomSpan_ != 0;
 	zoomSpan_ = 0;
 	axisEnd_ = LiveAxisEnd();
+
+	/* Also drop a zoom that was made while the axis was pinned, so the live view
+	 * really is the whole buffer again. */
+	frozenSpan_ = FullAxisSpan() + AxisLead() * 2;
 
 	if (changed) {
 		update();
