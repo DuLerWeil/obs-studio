@@ -10,6 +10,11 @@
 /* Smallest ring the cache allocates; it doubles from here as the buffer fills. */
 #define REPLAY_BUFFER_MIN_SLOTS 1024
 
+/* Written when a slot owns a reference and cleared when it is released, so a
+ * slot can only ever be released once and a stale one is reported instead of
+ * handing obs_encoder_packet_release() a dangling pointer. */
+#define REPLAY_BUFFER_SLOT_LIVE 0x52425331u
+
 /* The packet store is a ring so eviction only moves the head pointer: the old
  * flat array had to memmove half of the buffer every time it was compacted. */
 struct replay_buffer_packet {
@@ -17,6 +22,7 @@ struct replay_buffer_packet {
 	/* Absolute index, stored with the packet so a lookup can verify that the
 	 * slot it landed on is the one it asked for. */
 	uint64_t index;
+	uint32_t magic;
 };
 
 /* One GOP: a video keyframe and every packet that followed it until the next
@@ -83,6 +89,56 @@ static struct replay_buffer_packet *cache_slot_for_index(replay_buffer_cache_t *
 	return slot->index == index ? slot : NULL;
 }
 
+/* Releases the reference a slot owns, but only when the slot still describes
+ * itself: a slot that was already released, or one that does not hold the index
+ * it is supposed to, is reported and dropped instead of being released again. */
+static void cache_release_slot(replay_buffer_cache_t *cache, struct replay_buffer_packet *slot, size_t offset)
+{
+	const uint64_t expected = cache->first_index + offset;
+
+	if (slot->magic != REPLAY_BUFFER_SLOT_LIVE || slot->index != expected) {
+		blog(LOG_WARNING,
+		     "[replay buffer] slot %zu is stale (magic 0x%x, index %llu, expected %llu), dropping it", offset,
+		     slot->magic, (unsigned long long)slot->index, (unsigned long long)expected);
+		memset(&slot->packet, 0, sizeof(slot->packet));
+		slot->magic = 0;
+		return;
+	}
+
+	slot->magic = 0;
+	cache->total_size -= (int64_t)slot->packet.size;
+	obs_encoder_packet_release(&slot->packet);
+}
+
+/* Deep-copies a packet into a reference-counted block laid out the way
+ * obs_encoder_packet_release() expects (the count sits right before the data).
+ * Copies keep the ring the only owner of what it stores; taking a reference to
+ * the encoder's packet instead shares that count with libobs and the encoder,
+ * and when it goes stale the buffer is freed under the ring. */
+static bool cache_copy_packet(struct encoder_packet *dst, const struct encoder_packet *src)
+{
+	long *refs;
+
+	*dst = *src;
+
+	if (!src->data || !src->size) {
+		dst->data = NULL;
+		dst->size = 0;
+		return true;
+	}
+
+	refs = bmalloc(src->size + sizeof(long));
+	if (!refs) {
+		memset(dst, 0, sizeof(*dst));
+		return false;
+	}
+
+	dst->data = (uint8_t *)(refs + 1);
+	*refs = 1;
+	memcpy(dst->data, src->data, src->size);
+	return true;
+}
+
 static bool cache_reserve_slots(replay_buffer_cache_t *cache, size_t needed)
 {
 	if (needed <= cache->capacity)
@@ -125,9 +181,7 @@ static void cache_drop_front_gop(replay_buffer_cache_t *cache)
 	struct replay_buffer_gop *gop = cache_gop_at(cache, 0);
 
 	for (size_t i = 0; i < gop->packet_count && cache->count; i++) {
-		struct replay_buffer_packet *slot = cache_slot_at(cache, 0);
-		cache->total_size -= (int64_t)slot->packet.size;
-		obs_encoder_packet_release(&slot->packet);
+		cache_release_slot(cache, cache_slot_at(cache, 0), 0);
 		cache->head = (cache->head + 1) % cache->capacity;
 		cache->count--;
 		cache->first_index++;
@@ -212,7 +266,7 @@ void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 	pthread_mutex_lock(&cache->mutex);
 
 	for (size_t i = 0; i < cache->count; i++)
-		obs_encoder_packet_release(&cache_slot_at(cache, i)->packet);
+		cache_release_slot(cache, cache_slot_at(cache, i), i);
 
 	cache->head = 0;
 	cache->count = 0;
@@ -251,6 +305,20 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		return;
 	}
 
+	struct replay_buffer_packet *slot = cache_slot_at(cache, cache->count);
+	if (slot->magic == REPLAY_BUFFER_SLOT_LIVE) {
+		/* A live slot must never be overwritten: its reference would leak. */
+		blog(LOG_WARNING, "[replay buffer] slot %zu is still live while pushing", cache->count);
+		cache_release_slot(cache, slot, cache->count);
+	}
+
+	/* Copy before touching the GOP bookkeeping, so a failed allocation cannot
+	 * leave a GOP that claims a packet the ring does not hold. */
+	if (!cache_copy_packet(&slot->packet, packet)) {
+		pthread_mutex_unlock(&cache->mutex);
+		return;
+	}
+
 	if (starts_gop) {
 		struct replay_buffer_gop gop = {0};
 		gop.start_dts_usec = packet->dts_usec;
@@ -258,6 +326,7 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		gop.packet_count = 1;
 
 		if (!da_push_back(cache->gops, &gop)) {
+			obs_encoder_packet_release(&slot->packet);
 			pthread_mutex_unlock(&cache->mutex);
 			return;
 		}
@@ -265,9 +334,8 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		cache_gop_at(cache, cache_gop_count(cache) - 1)->packet_count++;
 	}
 
-	struct replay_buffer_packet *slot = cache_slot_at(cache, cache->count);
-	obs_encoder_packet_ref(&slot->packet, packet);
 	slot->index = cache->next_index;
+	slot->magic = REPLAY_BUFFER_SLOT_LIVE;
 	cache->count++;
 	cache->next_index++;
 
