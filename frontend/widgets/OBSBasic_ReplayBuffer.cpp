@@ -37,6 +37,15 @@ void OBSBasic::ReplayBufferActionTriggered()
 	}
 };
 
+obs_output_t *OBSBasic::GetReplayBufferOutput()
+{
+	if (!outputHandler || !outputHandler->replayBuffer) {
+		return nullptr;
+	}
+
+	return obs_output_get_ref(outputHandler->replayBuffer);
+}
+
 void OBSBasic::ShowReplayBufferPauseWarning()
 {
 	auto msgBox = []() {
