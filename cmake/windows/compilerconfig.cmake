@@ -43,6 +43,15 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.25.0)
   endif()
 endif()
 
+# Compiler caches (ccache/sccache) on MSVC can only cache objects compiled with /Z7 ("Embedded").
+# The block above forces /Zi with a plain set(), which shadows any -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+# given on the command line, so allow an explicit opt-in to switch back to /Z7.
+# Used by .github/workflows/windows-x64-build.yaml when the compiler cache is enabled; defaults to off,
+# so normal builds keep the /Zi behaviour.
+if(CMAKE_C_COMPILER_ID STREQUAL "MSVC" AND OBS_MSVC_EMBEDDED_DEBUG_INFO)
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+endif()
+
 message(DEBUG "Current Windows API version: ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
 if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION_MAXIMUM)
   message(DEBUG "Maximum Windows API version: ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION_MAXIMUM}")

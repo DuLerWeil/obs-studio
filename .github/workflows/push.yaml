@@ -19,9 +19,24 @@ jobs:
     permissions:
       contents: read
 
+  # Builds are not started by branch pushes in this fork: use the manual
+  # "Build (manual)" workflow or the nightly schedule. Tag pushes still build,
+  # because the release jobs below consume the artifacts.
+  #
+  # Build matrix switch: only Windows x64 is built unless the repository
+  # variables re-enable the other targets (BUILD_MACOS, BUILD_UBUNTU,
+  # BUILD_FLATPAK = 'true'; BUILD_WINDOWS = 'false' to drop Windows;
+  # BUILD_WINDOWS_ARCHITECTURES = '["x64", "arm64"]' to add arm64).
   build-project:
     name: Build 🧱
+    if: github.ref_type == 'tag'
     uses: ./.github/workflows/build-project.yaml
+    with:
+      macos: ${{ vars.BUILD_MACOS == 'true' }}
+      ubuntu: ${{ vars.BUILD_UBUNTU == 'true' }}
+      flatpak: ${{ vars.BUILD_FLATPAK == 'true' }}
+      windows: ${{ vars.BUILD_WINDOWS != 'false' }}
+      windows_architectures: ${{ vars.BUILD_WINDOWS_ARCHITECTURES || '["x64"]' }}
     secrets: inherit
     permissions:
       contents: read

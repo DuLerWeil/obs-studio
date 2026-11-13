@@ -1,6 +1,31 @@
 name: Build Project
 on:
   workflow_call:
+    inputs:
+      macos:
+        description: Build the macOS targets
+        type: boolean
+        default: true
+      ubuntu:
+        description: Build the Ubuntu target
+        type: boolean
+        default: true
+      flatpak:
+        description: Build the Flatpak target
+        type: boolean
+        default: true
+      windows:
+        description: Build the Windows targets
+        type: boolean
+        default: true
+      windows_architectures:
+        description: JSON array of Windows architectures to build
+        type: string
+        default: '["x64", "arm64"]'
+      package:
+        description: Override packaging (empty follows the triggering event)
+        type: string
+        default: ''
 jobs:
   check-event:
     name: Event Data 🔎
@@ -22,6 +47,7 @@ jobs:
         id: setup
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_PACKAGE: ${{ inputs.package }}
         run: |
           : Check Event Data ☑️
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
@@ -51,6 +77,15 @@ jobs:
             *) ;;
           esac
 
+          # Manual runs and forks can force artifact packaging on or off.
+          if [[ -n "${INPUT_PACKAGE}" ]]; then
+            for i in "${!config_data[@]}"; do
+              if [[ "${config_data[i]}" == package:* ]]; then
+                config_data[i]="package:${INPUT_PACKAGE}"
+              fi
+            done
+          fi
+
           for config in "${config_data[@]}"; do
             IFS=':' read -r key value <<< "${config}"
             echo "${key}=${value}" >> $GITHUB_OUTPUT
@@ -59,6 +94,7 @@ jobs:
 
   macos-build:
     name: macOS 🍏
+    if: ${{ inputs.macos }}
     runs-on: macos-26
     needs: check-event
     strategy:
@@ -179,6 +215,7 @@ jobs:
 
   ubuntu-build:
     name: Ubuntu 🐧
+    if: ${{ inputs.ubuntu }}
     strategy:
       fail-fast: false
       matrix:
@@ -254,6 +291,7 @@ jobs:
 
   flatpak-build:
     name: Flatpak 📦
+    if: ${{ inputs.flatpak }}
     runs-on: ubuntu-26.04
     needs: check-event
     defaults:
@@ -382,19 +420,94 @@ jobs:
 
   windows-build:
     name: Windows 🪟
+    if: ${{ inputs.windows }}
     strategy:
       matrix:
-        architecture: [x64, arm64]
+        architecture: ${{ fromJSON(inputs.windows_architectures) }}
     runs-on: windows-2025-vs2026
     needs: check-event
     defaults:
       run:
         shell: pwsh
+    env:
+      # Shared by the ccache install, build and save steps.
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: 'true'
+      CCACHE_MAXSIZE: 1G
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           fetch-depth: 0
+
+      # The compiler cache key has to follow the toolchain: a new MSVC toolset or
+      # a changed preset means every object would miss anyway.
+      - name: Detect Toolchain (cache key) 🔎
+        id: toolchain
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found: $vswhere" }
+
+          $vsQuery = @('-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64')
+          $vsPath = (& $vswhere @vsQuery -property installationPath).Trim()
+          $vsVer = (& $vswhere @vsQuery -property installationVersion).Trim()
+          $toolset = (Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1).Name
+
+          $arch = '${{ matrix.architecture }}'
+          $clDir = Join-Path $vsPath "VC\Tools\MSVC\$toolset\bin\Hostx64\$arch"
+          if (-not (Test-Path (Join-Path $clDir 'cl.exe'))) { throw "cl.exe not found: $clDir" }
+
+          $cmakeVer = ((cmake --version | Select-Object -First 1) -replace '[^0-9.]', '')
+          $presetHash = (Get-FileHash 'CMakePresets.json' -Algorithm SHA256).Hash.Substring(0, 8).ToLowerInvariant()
+          $prefix = ("ccache-win-$arch-vs{0}-msvc{1}-cmake{2}-{3}-" -f $vsVer, $toolset, $cmakeVer, $presetHash).ToLowerInvariant() -replace '[^a-z0-9._-]', '-'
+
+          "prefix=$prefix" >> $env:GITHUB_OUTPUT
+          "clDir=$clDir" >> $env:GITHUB_OUTPUT
+          Write-Host "cache prefix: $prefix"
+
+      - name: Restore Compiler Cache 🗄️
+        id: ccache-restore
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .ccache
+          key: ${{ steps.toolchain.outputs.prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.toolchain.outputs.prefix }}
+
+      - name: Install ccache 🧰
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CCACHE_TAG: 'v4.14.3'
+          CCACHE_HASH: 'c845c3d65be81954c75659145a522a793a27586bf940c5dcfe18af33fa1a67dd'
+          CL_DIR: ${{ steps.toolchain.outputs.clDir }}
+        run: |
+          # Pinned release plus a checksum, the same way bouf is pulled in.
+          New-Item -ItemType Directory -Force -Path ccache-bin | Out-Null
+          gh release download $env:CCACHE_TAG -R ccache/ccache -p 'ccache-*-windows-x86_64.zip' --dir ccache-bin --clobber
+          if ($LASTEXITCODE -ne 0) { throw "ccache download failed ($LASTEXITCODE)." }
+
+          $zip = Get-ChildItem 'ccache-bin' -Filter '*.zip' | Select-Object -First 1
+          if (-not $zip) { throw "ccache archive missing." }
+          if ((Get-FileHash $zip.FullName -Algorithm SHA256).Hash -ne $env:CCACHE_HASH) { throw "ccache checksum mismatch." }
+
+          Expand-Archive -Path $zip.FullName -DestinationPath 'ccache-bin\out' -Force
+          $exe = Get-ChildItem 'ccache-bin\out' -Filter 'ccache.exe' -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "ccache.exe missing from the archive." }
+          Copy-Item $exe.FullName 'ccache-bin\ccache.exe' -Force
+          "$PWD\ccache-bin" >> $env:GITHUB_PATH
+
+          # actions/cache/save fails outright when the path does not exist.
+          New-Item -ItemType Directory -Force -Path $env:CCACHE_DIR | Out-Null
+
+          # compilerconfig.cmake copies ccache over build_<arch>\cl.exe; CCACHE_PATH
+          # points it at the real compiler so the masquerade can resolve cl.exe.
+          "CCACHE_PATH=$env:CL_DIR" >> $env:GITHUB_ENV
+
+          & "$PWD\ccache-bin\ccache.exe" --version | Select-Object -First 1
+          # Statistics live in CCACHE_DIR and would otherwise be restored with the
+          # cache; resetting them here keeps this run's hit rate readable.
+          & "$PWD\ccache-bin\ccache.exe" -z
 
       - name: Build OBS Studio 🧱
         uses: ./.github/actions/build-obs
@@ -411,6 +524,44 @@ jobs:
         with:
           target: ${{ matrix.architecture }}
           config: ${{ needs.check-event.outputs.config }}
+
+      - name: Compiler Cache Stats 📈
+        if: always()
+        env:
+          CACHE_HIT: ${{ steps.ccache-restore.outputs.cache-hit }}
+        run: |
+          $ccache = Get-Command ccache -ErrorAction SilentlyContinue
+          if (-not $ccache) { Write-Host "::warning::ccache not found, skipping stats."; exit 0 }
+
+          (& $ccache.Source -s 2>&1 | Out-String).TrimEnd() | Write-Host
+
+      - name: Save Compiler Cache 🗄️
+        if: success() && github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
+      - name: Strip Debug Symbols 🧹
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        run: |
+          # The portable archive has no use for the debug databases, and they are
+          # the bulk of its size. CPack re-runs the install rules into its staging
+          # directory, so the files have to disappear here: every PDB install rule
+          # is OPTIONAL and a missing file is simply skipped.
+          $root = 'build_${{ matrix.architecture }}'
+          $pdbs = Get-ChildItem $root -Recurse -Filter *.pdb -File -ErrorAction SilentlyContinue
+          if (-not $pdbs) {
+            Write-Host 'no PDB files found'
+            exit 0
+          }
+
+          $size = ($pdbs | Measure-Object -Property Length -Sum).Sum
+          $pdbs | Remove-Item -Force
+
+          $summary = 'removed {0} PDB files ({1:N1} MiB)' -f $pdbs.Count, ($size / 1MB)
+          Write-Host $summary
+          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
       - name: Package OBS Studio 📀
         uses: ./.github/actions/package-obs

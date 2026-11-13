@@ -1,0 +1,31 @@
+name: Build (manual)
+run-name: Build (${{ inputs.platforms }}) 🧱
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Targets to build
+        type: choice
+        options:
+          - windows-x64
+          - windows-arm64
+          - all
+        default: windows-x64
+      package:
+        description: Package and upload artifacts
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build 🧱
+    uses: ./.github/workflows/build-project.yaml
+    with:
+      windows: true
+      windows_architectures: ${{ inputs.platforms != 'windows-x64' && '["x64", "arm64"]' || '["x64"]' }}
+      macos: ${{ inputs.platforms == 'all' }}
+      ubuntu: ${{ inputs.platforms == 'all' }}
+      flatpak: ${{ inputs.platforms == 'all' }}
+      package: ${{ inputs.package && 'true' || 'false' }}
+    secrets: inherit
