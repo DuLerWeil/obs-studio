@@ -89,6 +89,24 @@ static void ffmpeg_mux_destroy(void *data)
 {
 	struct ffmpeg_muxer *stream = data;
 
+	/* The GPU encode thread may still be delivering a packet. Stop it from
+	 * entering the replay buffer, then wait for the one that is already inside
+	 * before anything it touches is torn down: a late packet used to reach the
+	 * cache after it was freed, which is where the buffer crashed on stop. */
+	if (stream->replay_buffer_mutex_initialized) {
+		pthread_mutex_lock(&stream->replay_buffer_mutex);
+		os_atomic_set_bool(&stream->active, false);
+		os_atomic_set_bool(&stream->stopping, false);
+		stream->replay_shutdown = true;
+
+		if (stream->replay_cond_initialized) {
+			while (stream->replay_callbacks > 0)
+				pthread_cond_wait(&stream->replay_cond, &stream->replay_buffer_mutex);
+		}
+
+		pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	}
+
 	/* A save or a selection export may still be writing. Join it before any of
 	 * the state it reads (the packet list, the paths, the mutexes) goes away. */
 	if (stream->mux_thread_joinable) {
@@ -99,6 +117,10 @@ static void ffmpeg_mux_destroy(void *data)
 	replay_buffer_clear(stream);
 	replay_buffer_cache_destroy(stream->replay_cache);
 	stream->replay_cache = NULL;
+	if (stream->replay_cond_initialized) {
+		pthread_cond_destroy(&stream->replay_cond);
+		stream->replay_cond_initialized = false;
+	}
 	if (stream->replay_buffer_mutex_initialized) {
 		pthread_mutex_destroy(&stream->replay_buffer_mutex);
 		stream->replay_buffer_mutex_initialized = false;
@@ -1203,7 +1225,17 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 	}
 	stream->replay_buffer_mutex_initialized = true;
 
+	if (pthread_cond_init(&stream->replay_cond, NULL) != 0) {
+		pthread_mutex_destroy(&stream->replay_buffer_mutex);
+		stream->replay_buffer_mutex_initialized = false;
+		bfree(stream);
+		return NULL;
+	}
+	stream->replay_cond_initialized = true;
+
 	if (pthread_mutex_init(&stream->save_mutex, NULL) != 0) {
+		pthread_cond_destroy(&stream->replay_cond);
+		stream->replay_cond_initialized = false;
 		pthread_mutex_destroy(&stream->replay_buffer_mutex);
 		stream->replay_buffer_mutex_initialized = false;
 		bfree(stream);
@@ -1214,6 +1246,8 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 	stream->replay_cache = replay_buffer_cache_create(0);
 	if (!stream->replay_cache) {
 		pthread_mutex_destroy(&stream->save_mutex);
+		pthread_cond_destroy(&stream->replay_cond);
+		stream->replay_cond_initialized = false;
 		pthread_mutex_destroy(&stream->replay_buffer_mutex);
 		bfree(stream);
 		return NULL;
@@ -1544,12 +1578,52 @@ static void deactivate_replay_buffer(struct ffmpeg_muxer *stream, int code)
 	replay_buffer_clear(stream);
 }
 
+static void replay_buffer_data_process(struct ffmpeg_muxer *stream, struct encoder_packet *packet);
+
+/* Marks the callback as in flight so ffmpeg_mux_destroy() can wait for it.
+ * Returns false when the output is already shutting down. */
+static bool replay_buffer_callback_enter(struct ffmpeg_muxer *stream)
+{
+	if (!stream->replay_buffer_mutex_initialized)
+		return active(stream);
+
+	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	const bool ok = active(stream) && !stream->replay_shutdown;
+	if (ok)
+		stream->replay_callbacks++;
+	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	return ok;
+}
+
+static void replay_buffer_callback_leave(struct ffmpeg_muxer *stream)
+{
+	if (!stream->replay_buffer_mutex_initialized)
+		return;
+
+	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	stream->replay_callbacks--;
+	if (stream->replay_cond_initialized)
+		pthread_cond_signal(&stream->replay_cond);
+	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+}
+
 static void replay_buffer_data(void *data, struct encoder_packet *packet)
 {
 	struct ffmpeg_muxer *stream = data;
 
 	if (!active(stream))
 		return;
+
+	if (!replay_buffer_callback_enter(stream))
+		return;
+
+	replay_buffer_data_process(stream, packet);
+
+	replay_buffer_callback_leave(stream);
+}
+
+static void replay_buffer_data_process(struct ffmpeg_muxer *stream, struct encoder_packet *packet)
+{
 
 	/* encoder failure */
 	if (!packet) {

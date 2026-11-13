@@ -39,6 +39,13 @@ struct ffmpeg_muxer {
 	replay_buffer_frame_decoder_t *frame_decoder;
 	pthread_mutex_t replay_buffer_mutex;
 	bool replay_buffer_mutex_initialized;
+	/* The GPU encode thread may still hand us a packet while the output is being
+	 * destroyed; destroy sets replay_shutdown and waits for replay_callbacks to
+	 * reach zero before it frees anything the callback touches. */
+	volatile bool replay_shutdown;
+	int replay_callbacks;
+	pthread_cond_t replay_cond;
+	bool replay_cond_initialized;
 	pthread_mutex_t save_mutex;
 	bool save_mutex_initialized;
 	bool selection_export;
