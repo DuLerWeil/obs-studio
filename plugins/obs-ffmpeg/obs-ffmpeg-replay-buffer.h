@@ -63,6 +63,9 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
  * has already been evicted. */
 bool replay_buffer_cache_ref_keyframe_packet(replay_buffer_cache_t *cache, uint64_t seq, struct encoder_packet *packet);
 
+/* Refs the packet with that sequence number, keyframe or not. The caller releases it. */
+bool replay_buffer_cache_ref_packet(replay_buffer_cache_t *cache, uint64_t seq, struct encoder_packet *packet);
+
 /* Whole-buffer snapshot used by the save path. */
 replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cache_t *cache);
 void replay_buffer_snapshot_release(replay_buffer_snapshot_t *snapshot);

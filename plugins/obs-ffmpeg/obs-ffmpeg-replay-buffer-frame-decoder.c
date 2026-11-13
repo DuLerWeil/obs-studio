@@ -83,7 +83,7 @@ static void decoder_thread_set_low_priority(void)
 static void decoder_report_failure(struct replay_buffer_decoder *decoder, int code)
 {
 	if (decoder->failures < 3)
-		blog(LOG_DEBUG, "[replay buffer] keyframe decode failed (%d)", code);
+		blog(LOG_INFO, "[replay buffer] keyframe decode failed (%d)", code);
 
 	decoder->failures++;
 }
@@ -146,59 +146,85 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 }
 
 static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct replay_buffer_decoder *decoder,
-			   const struct encoder_packet *packet, uint8_t **out_rgba, uint32_t *out_width,
+			   const struct encoder_packet *packets, size_t count, uint8_t **out_rgba, uint32_t *out_width,
 			   uint32_t *out_height)
 {
-	if (!packet->data || !packet->size || packet->size > (size_t)INT_MAX)
+	if (!packets || !count)
+		return false;
+
+	if (!packets[0].data || !packets[0].size || packets[0].size > (size_t)INT_MAX)
 		return false;
 	if (!decoder_open(frame_decoder, decoder))
 		return false;
 
 	AVCodecContext *context = decoder->decoder;
-	AVPacket *av_packet = av_packet_alloc();
-	if (!av_packet)
-		return false;
-
-	if (av_new_packet(av_packet, (int)packet->size) < 0) {
-		av_packet_free(&av_packet);
-		return false;
-	}
-
-	memcpy(av_packet->data, packet->data, packet->size);
-	av_packet->pts = packet->pts;
-	av_packet->dts = packet->dts;
 
 	/* Every request starts from a keyframe, so a clean decoder state is enough;
 	 * there is no need to rebuild the decoder for each GOP. */
 	avcodec_flush_buffers(context);
-
-	int ret = avcodec_send_packet(context, av_packet);
-	av_packet_free(&av_packet);
-	if (ret < 0) {
-		decoder_report_failure(decoder, ret);
-		return false;
-	}
-
-	/* Drain the decoder so reordered keyframes are emitted even though no
-	 * following packets are available. The next request flushes again. */
-	avcodec_send_packet(context, NULL);
 
 	AVFrame *frame = av_frame_alloc();
 	if (!frame)
 		return false;
 
 	bool got_frame = false;
-	for (;;) {
-		ret = avcodec_receive_frame(context, frame);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+	for (size_t i = 0; i < count && !got_frame; i++) {
+		if (!packets[i].data || !packets[i].size || packets[i].size > (size_t)INT_MAX)
 			break;
-		if (ret < 0) {
-			decoder_report_failure(decoder, ret);
+
+		AVPacket *av_packet = av_packet_alloc();
+		if (!av_packet)
+			break;
+
+		if (av_new_packet(av_packet, (int)packets[i].size) < 0) {
+			av_packet_free(&av_packet);
 			break;
 		}
 
-		got_frame = true;
-		break;
+		memcpy(av_packet->data, packets[i].data, packets[i].size);
+		av_packet->pts = packets[i].pts;
+		av_packet->dts = packets[i].dts;
+		/* Without the flag a decoder that was just flushed may drop the packet
+		 * instead of starting a new GOP (HEVC in particular). */
+		if (packets[i].keyframe)
+			av_packet->flags |= AV_PKT_FLAG_KEY;
+
+		const int send_ret = avcodec_send_packet(context, av_packet);
+		av_packet_free(&av_packet);
+
+		if (send_ret < 0) {
+			decoder_report_failure(decoder, send_ret);
+			continue;
+		}
+
+		for (;;) {
+			const int ret = avcodec_receive_frame(context, frame);
+			if (ret == 0) {
+				got_frame = true;
+				break;
+			}
+			if (ret == AVERROR(EAGAIN))
+				break;
+			decoder_report_failure(decoder, ret);
+			break;
+		}
+	}
+
+	if (!got_frame) {
+		/* Drain: some streams only output the first frame once the decoder is
+		 * told there is no more input. */
+		avcodec_send_packet(context, NULL);
+
+		for (;;) {
+			const int ret = avcodec_receive_frame(context, frame);
+			if (ret == 0) {
+				got_frame = true;
+				break;
+			}
+			if (ret == AVERROR(EAGAIN))
+				break;
+			break;
+		}
 	}
 
 	if (!got_frame) {
@@ -255,7 +281,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	*out_height = (uint32_t)height;
 	return true;
 }
-
 static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t seq, uint64_t request_id)
 {
 	uint8_t *rgba = NULL;
@@ -263,10 +288,28 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, uint64_t
 	uint32_t height = 0;
 	bool decoded = false;
 
-	struct encoder_packet packet;
-	if (replay_buffer_cache_ref_keyframe_packet(frame_decoder->cache, seq, &packet)) {
-		decoded = decoder_decode(frame_decoder, &frame_decoder->decoder, &packet, &rgba, &width, &height);
-		obs_encoder_packet_release(&packet);
+	/* Feed the requested keyframe plus a few packets after it: encoders with
+	 * B-frames may not output that first frame until they see more input, and a
+	 * keyframe alone then decodes to nothing. */
+	struct encoder_packet packets[9];
+	size_t count = 0;
+	const size_t max_packets = sizeof(packets) / sizeof(packets[0]);
+	for (size_t i = 0; i < max_packets; i++) {
+		struct encoder_packet packet;
+		if (!replay_buffer_cache_ref_packet(frame_decoder->cache, seq + i, &packet))
+			break;
+		if (i == 0 && !(packet.type == OBS_ENCODER_VIDEO && packet.keyframe)) {
+			obs_encoder_packet_release(&packet);
+			break;
+		}
+		packets[count++] = packet;
+	}
+
+	if (count) {
+		decoded =
+			decoder_decode(frame_decoder, &frame_decoder->decoder, packets, count, &rgba, &width, &height);
+		for (size_t i = 0; i < count; i++)
+			obs_encoder_packet_release(&packets[i]);
 	}
 
 	pthread_mutex_lock(&frame_decoder->mutex);

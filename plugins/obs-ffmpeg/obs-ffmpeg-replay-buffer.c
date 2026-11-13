@@ -635,6 +635,27 @@ bool replay_buffer_cache_ref_keyframe_packet(replay_buffer_cache_t *cache, uint6
 	return found;
 }
 
+bool replay_buffer_cache_ref_packet(replay_buffer_cache_t *cache, uint64_t seq, struct encoder_packet *packet)
+{
+	if (!cache || !packet)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&cache->mutex);
+
+	if (seq >= cache->first_seq) {
+		const uint64_t packet_index = seq - cache->first_seq;
+		if (packet_index < cache_packet_count(cache)) {
+			obs_encoder_packet_ref(packet,
+					       &cache->packets.array[cache->packets_head + (size_t)packet_index]);
+			found = true;
+		}
+	}
+
+	pthread_mutex_unlock(&cache->mutex);
+	return found;
+}
+
 replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cache_t *cache)
 {
 	if (!cache)
