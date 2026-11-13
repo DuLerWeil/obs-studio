@@ -817,15 +817,15 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	goLiveButton_ = makeButton(ThemeIcon("media/media_restart.svg"),
 				   QTStr("Basic.Main.Preview.ReplayBuffer.GoLiveHint"), navIconSize);
 
-	/* Two explicit buttons replace the old options menu: saving the whole buffer
-	 * and exporting the marked clip are different enough to be separate. They
-	 * use icons so the row stays on one line next to the scale. */
-	saveButton_ = makeButton(ThemeIcon("save.svg"), QTStr("Basic.Main.SaveReplay"), navIconSize);
+	/* Two explicit buttons replace the old options menu: exporting the whole
+	 * buffer and exporting the marked clip. Their icons share the save arrow and
+	 * tray; a full bar marks the whole buffer, framing corners mark a selection. */
+	saveButton_ = makeButton(ThemeIcon("replay-save-all.svg"), QTStr("Basic.Main.SaveReplay"), navIconSize);
 	connect(saveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::SaveReplay);
 
 	exportAction_ = new QAction(QTStr("Basic.Main.Preview.ReplayBuffer.ExportSelection"), this);
 	exportAction_->setEnabled(false);
-	exportAction_->setIcon(ThemeIcon("popout.svg"));
+	exportAction_->setIcon(ThemeIcon("replay-save-selection.svg"));
 	/* Icon-only, so the action text doubles as the tooltip. */
 	exportAction_->setToolTip(exportAction_->text());
 	connect(exportAction_, &QAction::triggered, this, &OBSReplayBufferPanel::ExportSelection);
