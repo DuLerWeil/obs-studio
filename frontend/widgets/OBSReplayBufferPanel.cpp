@@ -42,6 +42,10 @@ constexpr int kEdgeMargin = 2;
 constexpr int kLabelGap = 2;
 /* Space between the outer buttons of the timeline row and the panel edge. */
 constexpr int kRowSideMargin = 12;
+/* Shortest gap between two frame requests while the playhead is dragged. The
+ * plugin keeps only the newest request, so this is about sparing the decoder,
+ * not about queueing. */
+constexpr int kDragFrameIntervalMs = 80;
 constexpr int kTrackInset = 2;
 constexpr int kGrooveHeight = 4;
 constexpr int kMarkerHeight = 7;
@@ -1466,10 +1470,17 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	 * back at the live edge the program preview takes over again. */
 	UpdateReviewState();
 
-	/* Only the release asks for a picture: the plugin decodes one full frame
-	 * per request, so asking for every drag sample would just drop them all. */
+	/* Refresh the picture while the playhead moves, not just on release. The
+	 * plugin keeps only the newest request, so a short throttle is enough to
+	 * keep the decoder from being flooded. */
 	if (finished) {
+		dragFrameElapsed_.invalidate();
 		RequestFrame();
+	} else if (!dragFrameElapsed_.isValid() || dragFrameElapsed_.elapsed() >= kDragFrameIntervalMs) {
+		dragFrameElapsed_.start();
+		/* Snapping the playhead to a keyframe mid-drag would yank it out from
+		 * under the cursor, so only the release snaps. */
+		RequestFrame(false);
 	}
 }
 
@@ -1525,7 +1536,7 @@ void OBSReplayBufferPanel::SnapSelection()
 	exportAction_->setEnabled(!exportRunning_ && Active());
 }
 
-void OBSReplayBufferPanel::RequestFrame()
+void OBSReplayBufferPanel::RequestFrame(bool snap)
 {
 	if (!visible_ || !Active()) {
 		return;
@@ -1558,22 +1569,26 @@ void OBSReplayBufferPanel::RequestFrame()
 	}
 
 	if (seq < 0) {
-		blog(LOG_INFO, "[replay buffer] review %.3fs: no keyframe at this position",
-		     (double)positionUsec_ / 1000000.0);
+		if (snap) {
+			blog(LOG_INFO, "[replay buffer] review %.3fs: no keyframe at this position",
+			     (double)positionUsec_ / 1000000.0);
+		}
 		/* Nothing decodable at this position; drop the stale frame so the
 		 * canvas falls back to the live picture. */
 		ClearReviewFrame();
 		return;
 	}
 
-	blog(LOG_INFO, "[replay buffer] review %.3fs: keyframe %lld (seq %lld)", (double)positionUsec_ / 1000000.0,
-	     index, seq);
+	if (snap) {
+		blog(LOG_INFO, "[replay buffer] review %.3fs: keyframe %lld (seq %lld)",
+		     (double)positionUsec_ / 1000000.0, index, seq);
+	}
 
 	/* Snap the playhead to the keyframe that will actually be shown, so the
 	 * position label, the canvas and the previous/next keyframe actions all
 	 * refer to the same frame. */
 	const int64_t snapped = qBound(rangeStartUsec_, dts, rangeEndUsec_);
-	if (snapped != positionUsec_) {
+	if (snap && snapped != positionUsec_) {
 		positionUsec_ = snapped;
 		followLive_ = snapped >= rangeEndUsec_ - 200000;
 		timeline_->SetPosition(snapped);

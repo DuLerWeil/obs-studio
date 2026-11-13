@@ -174,7 +174,7 @@ private:
 	void JumpTo(int64_t position_usec);
 	/* Resolve the keyframe at the current position and ask the plugin for its
 	 * full frame; this is what feeds the canvas. */
-	void RequestFrame();
+	void RequestFrame(bool snap = true);
 	void RequestFullFrame(uint64_t seq);
 	void CancelFullFrame();
 	void SnapSelection();
@@ -211,6 +211,8 @@ private:
 	QTimer exportTimer_;
 	QTimer selectionSettleTimer_;
 	QElapsedTimer fullFrameElapsed_;
+	/* Throttles the frame requests while the playhead is dragged. */
+	QElapsedTimer dragFrameElapsed_;
 
 	int64_t rangeStartUsec_ = 0;
 	int64_t rangeEndUsec_ = 0;
