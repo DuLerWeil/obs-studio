@@ -42,6 +42,10 @@ constexpr int kEdgeMargin = 2;
 constexpr int kLabelGap = 2;
 /* Space between the outer buttons of the timeline row and the panel edge. */
 constexpr int kRowSideMargin = 12;
+/* Vertical breathing room above and below the two rows. Folded away with them,
+ * so a collapsed panel takes no space at all. */
+constexpr int kPanelTopMargin = 4;
+constexpr int kPanelBottomMargin = 6;
 
 constexpr int kTrackInset = 2;
 constexpr int kGrooveHeight = 4;
@@ -880,7 +884,7 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	auto *layout = new QVBoxLayout(this);
 	/* No side margins: the panel is docked directly under the preview column
 	 * and has to line up with the zoom row and the scroll bars above it. */
-	layout->setContentsMargins(0, 4, 0, 6);
+	layout->setContentsMargins(0, kPanelTopMargin, 0, kPanelBottomMargin);
 	layout->setSpacing(kPanelSpacing);
 	layout->addLayout(timelineRow);
 
@@ -1312,6 +1316,17 @@ void OBSReplayBufferPanel::UpdateCollapsedState()
 	saveButton_->setVisible(!collapsed_);
 	exportButton_->setVisible(!collapsed_);
 	goLiveButton_->setVisible(!collapsed_);
+
+	/* The transient export status lives in the timeline row, so it folds with it. */
+	cacheLabel_->setVisible(!collapsed_ && exportRunning_);
+
+	/* With the rows hidden the margins and the gap between them were the only
+	 * thing left of the panel, so they go too and the strip collapses to nothing. */
+	if (QLayout *panelLayout = layout()) {
+		panelLayout->setContentsMargins(0, collapsed_ ? 0 : kPanelTopMargin, 0,
+						collapsed_ ? 0 : kPanelBottomMargin);
+		panelLayout->setSpacing(collapsed_ ? 0 : kPanelSpacing);
+	}
 
 	/* The panel height follows the rows that are still visible, so folding it
 	 * gives the preview its space back instead of leaving an empty strip. */
