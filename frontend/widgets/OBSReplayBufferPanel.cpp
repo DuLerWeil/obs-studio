@@ -38,7 +38,7 @@ constexpr int kPanelSpacing = 4;
  * never clipped when the UI is scaled up. */
 constexpr int kEdgeMargin = 2;
 constexpr int kLabelGap = 2;
-constexpr int kTrackInset = 8;
+constexpr int kTrackInset = 2;
 constexpr int kGrooveHeight = 4;
 constexpr int kMarkerHeight = 7;
 constexpr int kMarkHalfWidth = 4;
@@ -46,9 +46,6 @@ constexpr int kTickHeight = 12;
 constexpr int kRulerMinSpacing = 80;
 /* Floor for the wheel zoom, so a notch cannot collapse the scale to nothing. */
 constexpr int64_t kMinZoomSpan = 2000000;
-/* The scale sits inside the track with a 10 % margin on each side; while the
- * axis is frozen the ruler slides into the right hand margin. */
-constexpr double kAxisMargin = 0.10;
 
 /* Same tick colour the mixer's volume scale uses (VolumeSlider::paintEvent),
  * so the two scales read as the same control. */
@@ -300,13 +297,16 @@ int64_t OBSReplayBufferTimeline::AxisStart() const
 
 int OBSReplayBufferTimeline::AxisLeft() const
 {
-	return TrackLeft() + (int)((double)TrackWidth() * kAxisMargin);
+	/* The widget shares its row with the step buttons, so the scale fills the
+	 * whole track instead of keeping a margin on each side. The frozen axis has
+	 * the reserved part past "now" to slide into, which is where the ruler
+	 * drifts once a historical moment is parked. */
+	return TrackLeft();
 }
 
 int OBSReplayBufferTimeline::AxisWidth() const
 {
-	const int inset = (int)((double)TrackWidth() * kAxisMargin);
-	return qMax(1, TrackWidth() - inset * 2);
+	return TrackWidth();
 }
 
 double OBSReplayBufferTimeline::RatioForTime(int64_t time_usec) const
