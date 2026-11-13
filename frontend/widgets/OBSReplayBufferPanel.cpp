@@ -907,10 +907,18 @@ void OBSReplayBufferPanel::UpdateCollapseButtonSize()
 
 	/* Match the combo's drop-down button: a square of the control height minus
 	 * its padding, with a pre-scaled glyph so the style sheet's icon-size cannot
-	 * blow it up again. Called again once the window is laid out, because the
-	 * reference still has its designer size while the ctor runs. */
-	const int height = foldReference_ ? foldReference_->height() : 0;
-	const int side = qMax(14, height - 8);
+	 * blow it up again.
+	 *
+	 * A fresh widget reports Qt's default 640x480 box until the preview column is
+	 * laid out, so an unshown reference is measured through its size hint and the
+	 * result is clamped: a bogus height would hand the button a huge fixed size,
+	 * which squeezed the whole panel out of the column. */
+	int height = foldReference_ ? foldReference_->sizeHint().height() : 0;
+	if (foldReference_ && foldReference_->isVisible()) {
+		height = foldReference_->height();
+	}
+
+	const int side = qBound(14, height - 8, 34);
 	collapseIconSide_ = qMax(8, side - 4);
 	collapseButton_->setFixedSize(side, side);
 	ApplyCollapseIcon();
