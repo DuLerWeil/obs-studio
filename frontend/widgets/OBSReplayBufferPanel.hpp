@@ -18,7 +18,6 @@ class QAction;
 class QHBoxLayout;
 class QLabel;
 class QLayout;
-class QMenu;
 class QPainter;
 class QTimer;
 class QToolButton;
@@ -182,12 +181,11 @@ private:
 	QLabel *cacheLabel_;
 	QToolButton *prevButton_;
 	QToolButton *nextButton_;
+	QToolButton *saveButton_;
+	QToolButton *exportButton_;
 	QToolButton *goLiveButton_;
-	QToolButton *menuButton_;
 	QToolButton *collapseButton_;
-	QMenu *menu_;
 	QAction *exportAction_;
-	QHBoxLayout *controlRow_ = nullptr;
 	OBSReplayBufferTimeline *timeline_ = nullptr;
 
 	/* The reviewed frame is uploaded as a texture on the graphics thread and

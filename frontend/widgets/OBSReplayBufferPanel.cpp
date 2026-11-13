@@ -12,7 +12,6 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLayout>
-#include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
@@ -792,24 +791,24 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	goLiveButton_ = makeButton(QStyle::SP_MediaSkipForward, QTStr("Basic.Main.Preview.ReplayBuffer.GoLiveHint"),
 				   navIconSize);
 
-	menuButton_ = new QToolButton(this);
-	menuButton_->setAutoRaise(true);
-	menuButton_->setFocusPolicy(Qt::NoFocus);
-	menuButton_->setIconSize(QSize(iconSize, iconSize));
-	menuButton_->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
-	menuButton_->setToolTip(QTStr("Basic.Main.Preview.ReplayBuffer.Options"));
-	menuButton_->setPopupMode(QToolButton::InstantPopup);
+	/* Two explicit buttons replace the old options menu: saving the whole buffer
+	 * and exporting the marked clip are different enough to be separate. */
+	saveButton_ = new QToolButton(this);
+	saveButton_->setAutoRaise(true);
+	saveButton_->setFocusPolicy(Qt::NoFocus);
+	saveButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+	saveButton_->setText(QTStr("Basic.Main.SaveReplay"));
+	connect(saveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::SaveReplay);
 
-	menu_ = new QMenu(menuButton_);
-
-	QAction *saveAction = menu_->addAction(QTStr("Basic.Main.SaveReplay"));
-	connect(saveAction, &QAction::triggered, this, &OBSReplayBufferPanel::SaveReplay);
-
-	exportAction_ = menu_->addAction(QTStr("Basic.Main.Preview.ReplayBuffer.ExportSelection"));
+	exportAction_ = new QAction(QTStr("Basic.Main.Preview.ReplayBuffer.ExportSelection"), this);
 	exportAction_->setEnabled(false);
 	connect(exportAction_, &QAction::triggered, this, &OBSReplayBufferPanel::ExportSelection);
 
-	menuButton_->setMenu(menu_);
+	exportButton_ = new QToolButton(this);
+	exportButton_->setAutoRaise(true);
+	exportButton_->setFocusPolicy(Qt::NoFocus);
+	exportButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+	exportButton_->setDefaultAction(exportAction_);
 
 	collapseButton_ = new QToolButton(this);
 	collapseButton_->setAutoRaise(true);
@@ -819,28 +818,25 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 
 	timeline_ = new OBSReplayBufferTimeline(this);
 
-	auto *controlRow = new QHBoxLayout;
-	controlRow_ = controlRow;
-	controlRow->setContentsMargins(0, 0, 0, 0);
-	controlRow->setSpacing(2);
-	/* Centre the controls in the docked strip; the export status label only
-	 * takes room while it is visible. */
-	controlRow->addStretch(1);
-	controlRow->addWidget(prevButton_);
-	controlRow->addWidget(nextButton_);
-	controlRow->addWidget(cacheLabel_);
-	controlRow->addWidget(goLiveButton_);
-	controlRow->addWidget(menuButton_);
-	controlRow->addWidget(collapseButton_);
-	controlRow->addStretch(1);
+	/* Everything sits on the timeline row: the keyframe steps at the far left,
+	 * the scale in the middle and the save actions plus "go live" on the right. */
+	auto *timelineRow = new QHBoxLayout;
+	timelineRow->setContentsMargins(0, 0, 0, 0);
+	timelineRow->setSpacing(4);
+	timelineRow->addWidget(prevButton_);
+	timelineRow->addWidget(nextButton_);
+	timelineRow->addWidget(timeline_, 1);
+	timelineRow->addWidget(cacheLabel_);
+	timelineRow->addWidget(saveButton_);
+	timelineRow->addWidget(exportButton_);
+	timelineRow->addWidget(goLiveButton_);
 
 	auto *layout = new QVBoxLayout(this);
 	/* No side margins: the panel is docked directly under the preview column
 	 * and has to line up with the zoom row and the scroll bars above it. */
 	layout->setContentsMargins(0, 4, 0, 6);
 	layout->setSpacing(kPanelSpacing);
-	layout->addWidget(timeline_);
-	layout->addLayout(controlRow);
+	layout->addLayout(timelineRow);
 
 	infoTimer_.setInterval(1000);
 	connect(&infoTimer_, &QTimer::timeout, this, &OBSReplayBufferPanel::RefreshInfo);
@@ -874,10 +870,6 @@ void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, const QWidge
 		return;
 	}
 
-	if (controlRow_) {
-		controlRow_->removeWidget(collapseButton_);
-	}
-
 	layout->addWidget(collapseButton_);
 
 	if (!reference) {
@@ -895,11 +887,12 @@ void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, const QWidge
 		return;
 	}
 
-	/* The chevron itself is square, so match that instead of the taller
-	 * drop-down strip the combo lays it in. */
-	const int side = qMax(10, qMin(arrow.width(), arrow.height()));
-	collapseButton_->setFixedSize(side, side);
-	collapseButton_->setIconSize(QSize(qMax(8, side - 4), qMax(8, side - 4)));
+	/* Match the combo's drop-down button, so the two controls are the same size
+	 * and the fold button does not tower over the zoom row. */
+	const QSize box = arrow.size();
+	const int iconSide = qMax(8, qMin(box.width(), box.height()) - 6);
+	collapseButton_->setFixedSize(box);
+	collapseButton_->setIconSize(QSize(iconSide, iconSide));
 }
 
 OBSReplayBufferPanel::~OBSReplayBufferPanel()
@@ -1230,8 +1223,9 @@ void OBSReplayBufferPanel::UpdateCollapsedState()
 	timeline_->setVisible(!collapsed_);
 	prevButton_->setVisible(!collapsed_);
 	nextButton_->setVisible(!collapsed_);
+	saveButton_->setVisible(!collapsed_);
+	exportButton_->setVisible(!collapsed_);
 	goLiveButton_->setVisible(!collapsed_);
-	menuButton_->setVisible(!collapsed_);
 
 	/* The panel height follows the rows that are still visible, so folding it
 	 * gives the preview its space back instead of leaving an empty strip. */
@@ -1334,7 +1328,7 @@ void OBSReplayBufferPanel::UpdateControls()
 	timeline_->setEnabled(usable);
 	prevButton_->setEnabled(usable);
 	nextButton_->setEnabled(usable);
-	menuButton_->setEnabled(usable);
+	saveButton_->setEnabled(usable);
 	goLiveButton_->setEnabled(usable && positionUsec_ < rangeEndUsec_ - 200000);
 	exportAction_->setEnabled(usable && timeline_->HasSelection());
 }
