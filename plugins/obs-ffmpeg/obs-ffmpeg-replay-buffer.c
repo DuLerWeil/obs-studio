@@ -11,27 +11,28 @@
 #define REPLAY_BUFFER_MIN_SLOTS 1024
 
 /* Written when a slot owns a reference and cleared when it is released, so a
- * slot can only ever be released once and a stale one is reported instead of
- * handing obs_encoder_packet_release() a dangling pointer. */
+ * slot can only ever be released once. */
 #define REPLAY_BUFFER_SLOT_LIVE 0x52425331u
 
-/* The packet store is a ring so eviction only moves the head pointer: the old
- * flat array had to memmove half of the buffer every time it was compacted. */
+/* The packet store is addressed by absolute packet index. The ring slot for an
+ * index is simply "index % capacity", so there is no head pointer, no count and
+ * no per-GOP packet counter: the only positions the cache keeps are the first
+ * and the next index, and both only ever move forward when a packet is stored or
+ * a whole GOP is dropped. Nothing derives a slot from a counter that could drift
+ * out of step with the ring, and every slot carries the index it holds, so a
+ * lookup either finds that exact packet or nothing at all. */
 struct replay_buffer_packet {
 	struct encoder_packet packet;
-	/* Absolute index, stored with the packet so a lookup can verify that the
-	 * slot it landed on is the one it asked for. */
 	uint64_t index;
 	uint32_t magic;
 };
 
 /* One GOP: a video keyframe and every packet that followed it until the next
- * keyframe. Packets of a GOP are contiguous in the ring, so a GOP is described
- * by where it starts and how long it is. */
+ * keyframe. Its extent is defined by where the next GOP starts, not by a count
+ * that would have to be kept in step with every push. */
 struct replay_buffer_gop {
 	int64_t start_dts_usec;
 	uint64_t first_index;
-	size_t packet_count;
 };
 
 struct replay_buffer_cache {
@@ -39,14 +40,13 @@ struct replay_buffer_cache {
 
 	struct replay_buffer_packet *slots;
 	size_t capacity;
-	size_t head;
-	size_t count;
+
+	uint64_t first_index;
+	uint64_t next_index;
 
 	DARRAY(struct replay_buffer_gop) gops;
 	size_t gops_head;
 
-	uint64_t first_index;
-	uint64_t next_index;
 	int64_t first_dts_usec;
 	int64_t last_dts_usec;
 	int64_t total_size;
@@ -60,46 +60,50 @@ struct replay_buffer_snapshot {
 	DARRAY(struct encoder_packet) packets;
 };
 
+static size_t cache_packet_count(const replay_buffer_cache_t *cache)
+{
+	return (size_t)(cache->next_index - cache->first_index);
+}
+
 static size_t cache_gop_count(const replay_buffer_cache_t *cache)
 {
 	return cache->gops.num - cache->gops_head;
 }
 
-static struct replay_buffer_gop *cache_gop_at(replay_buffer_cache_t *cache, size_t index)
+static struct replay_buffer_gop *cache_gop_at(const replay_buffer_cache_t *cache, size_t index)
 {
 	return &cache->gops.array[cache->gops_head + index];
 }
 
-static struct replay_buffer_packet *cache_slot_at(replay_buffer_cache_t *cache, size_t offset)
+/* Raw slot for an absolute index, without checking what the slot holds. */
+static struct replay_buffer_packet *cache_slot_at(replay_buffer_cache_t *cache, uint64_t index)
 {
-	return &cache->slots[(cache->head + offset) % cache->capacity];
+	return &cache->slots[index % cache->capacity];
 }
 
-/* Maps an absolute index to its slot and checks the slot really holds it. */
-static struct replay_buffer_packet *cache_slot_for_index(replay_buffer_cache_t *cache, uint64_t index)
+/* Slot for an absolute index, but only when it really holds that packet. */
+static struct replay_buffer_packet *cache_live_slot(replay_buffer_cache_t *cache, uint64_t index)
 {
-	if (index < cache->first_index)
+	if (index < cache->first_index || index >= cache->next_index)
 		return NULL;
 
-	const uint64_t offset = index - cache->first_index;
-	if (offset >= cache->count)
+	struct replay_buffer_packet *slot = cache_slot_at(cache, index);
+	if (slot->magic != REPLAY_BUFFER_SLOT_LIVE || slot->index != index)
 		return NULL;
 
-	struct replay_buffer_packet *slot = cache_slot_at(cache, (size_t)offset);
-	return slot->index == index ? slot : NULL;
+	return slot;
 }
 
-/* Releases the reference a slot owns, but only when the slot still describes
- * itself: a slot that was already released, or one that does not hold the index
- * it is supposed to, is reported and dropped instead of being released again. */
-static void cache_release_slot(replay_buffer_cache_t *cache, struct replay_buffer_packet *slot, size_t offset)
+/* Releases the reference a slot owns, but only when the slot still holds the
+ * index it is being released for. Anything else is reported and dropped, so a
+ * stale slot can never reach obs_encoder_packet_release(). */
+static void cache_release_slot(replay_buffer_cache_t *cache, uint64_t index)
 {
-	const uint64_t expected = cache->first_index + offset;
+	struct replay_buffer_packet *slot = cache_slot_at(cache, index);
 
-	if (slot->magic != REPLAY_BUFFER_SLOT_LIVE || slot->index != expected) {
-		blog(LOG_WARNING,
-		     "[replay buffer] slot %zu is stale (magic 0x%x, index %llu, expected %llu), dropping it", offset,
-		     slot->magic, (unsigned long long)slot->index, (unsigned long long)expected);
+	if (slot->magic != REPLAY_BUFFER_SLOT_LIVE || slot->index != index) {
+		blog(LOG_WARNING, "[replay buffer] slot for index %llu is stale (magic 0x%x, holds %llu), dropping it",
+		     (unsigned long long)index, slot->magic, (unsigned long long)slot->index);
 		memset(&slot->packet, 0, sizeof(slot->packet));
 		slot->magic = 0;
 		return;
@@ -110,6 +114,8 @@ static void cache_release_slot(replay_buffer_cache_t *cache, struct replay_buffe
 	obs_encoder_packet_release(&slot->packet);
 }
 
+/* Grows the ring and re-places the live packets. Empty slots are zeroed, so
+ * their marker never looks live. */
 static bool cache_reserve_slots(replay_buffer_cache_t *cache, size_t needed)
 {
 	if (needed <= cache->capacity)
@@ -119,17 +125,16 @@ static bool cache_reserve_slots(replay_buffer_cache_t *cache, size_t needed)
 	while (capacity < needed)
 		capacity *= 2;
 
-	struct replay_buffer_packet *slots = bmalloc(sizeof(*slots) * capacity);
+	struct replay_buffer_packet *slots = bzalloc(sizeof(*slots) * capacity);
 	if (!slots)
 		return false;
 
-	for (size_t i = 0; i < cache->count; i++)
-		slots[i] = *cache_slot_at(cache, i);
+	for (uint64_t index = cache->first_index; index < cache->next_index; index++)
+		slots[index % capacity] = *cache_slot_at(cache, index);
 
 	bfree(cache->slots);
 	cache->slots = slots;
 	cache->capacity = capacity;
-	cache->head = 0;
 	return true;
 }
 
@@ -147,26 +152,33 @@ static void cache_compact_gops(replay_buffer_cache_t *cache)
 	cache->gops_head = 0;
 }
 
+/* Drops the oldest GOP. Its extent runs from its own keyframe to the keyframe of
+ * the next GOP, or to the newest packet when it is the last one buffered. */
 static void cache_drop_front_gop(replay_buffer_cache_t *cache)
 {
-	struct replay_buffer_gop *gop = cache_gop_at(cache, 0);
+	const uint64_t start = cache_gop_at(cache, 0)->first_index;
+	const uint64_t end = cache_gop_count(cache) > 1 ? cache_gop_at(cache, 1)->first_index : cache->next_index;
 
-	for (size_t i = 0; i < gop->packet_count && cache->count; i++) {
-		cache_release_slot(cache, cache_slot_at(cache, 0), 0);
-		cache->head = (cache->head + 1) % cache->capacity;
-		cache->count--;
-		cache->first_index++;
-	}
+	for (uint64_t index = start; index < end && index < cache->next_index; index++)
+		cache_release_slot(cache, index);
 
-	cache->gops_head++;
+	cache->first_index = end;
+
+	/* The GOP index follows the packets, not the other way round: every entry
+	 * whose packets are gone is dropped, so the two can never disagree even if a
+	 * caller dropped a GOP more than once. */
+	while (cache_gop_count(cache) > 0 && cache_gop_at(cache, 0)->first_index < cache->first_index)
+		cache->gops_head++;
+
 	cache_compact_gops(cache);
 
-	if (!cache->count) {
+	if (cache->first_index >= cache->next_index) {
 		cache->first_dts_usec = 0;
 		cache->last_dts_usec = 0;
 		cache->total_size = 0;
 	} else {
-		cache->first_dts_usec = cache_slot_at(cache, 0)->packet.dts_usec;
+		struct replay_buffer_packet *slot = cache_live_slot(cache, cache->first_index);
+		cache->first_dts_usec = slot ? slot->packet.dts_usec : 0;
 	}
 }
 
@@ -236,17 +248,14 @@ void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 
 	pthread_mutex_lock(&cache->mutex);
 
-	for (size_t i = 0; i < cache->count; i++)
-		cache_release_slot(cache, cache_slot_at(cache, i), i);
-
-	cache->head = 0;
-	cache->count = 0;
-	da_clear(cache->gops);
-	cache->gops_head = 0;
+	for (uint64_t index = cache->first_index; index < cache->next_index; index++)
+		cache_release_slot(cache, index);
 
 	/* next_index is intentionally not reset: stale asynchronous frame requests
 	 * must not match packets from a later session. */
 	cache->first_index = cache->next_index;
+	da_clear(cache->gops);
+	cache->gops_head = 0;
 	cache->first_dts_usec = 0;
 	cache->last_dts_usec = 0;
 	cache->total_size = 0;
@@ -271,43 +280,39 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		return;
 	}
 
-	if (!cache_reserve_slots(cache, cache->count + 1)) {
+	if (!cache_reserve_slots(cache, cache_packet_count(cache) + 1)) {
 		pthread_mutex_unlock(&cache->mutex);
 		return;
 	}
 
-	struct replay_buffer_packet *slot = cache_slot_at(cache, cache->count);
+	struct replay_buffer_packet *slot = cache_slot_at(cache, cache->next_index);
 	if (slot->magic == REPLAY_BUFFER_SLOT_LIVE) {
 		/* A live slot must never be overwritten: its reference would leak. */
-		blog(LOG_WARNING, "[replay buffer] slot %zu is still live while pushing", cache->count);
-		cache_release_slot(cache, slot, cache->count);
+		blog(LOG_WARNING, "[replay buffer] slot for index %llu is still live while pushing",
+		     (unsigned long long)cache->next_index);
+		cache_release_slot(cache, cache->next_index);
 	}
 
-	/* Reference the packet: the payload is already reference counted and the
-	 * ring keeps it alive exactly as long as it holds the slot. */
 	obs_encoder_packet_ref(&slot->packet, packet);
+	slot->index = cache->next_index;
+	slot->magic = REPLAY_BUFFER_SLOT_LIVE;
 
 	if (starts_gop) {
 		struct replay_buffer_gop gop = {0};
 		gop.start_dts_usec = packet->dts_usec;
 		gop.first_index = cache->next_index;
-		gop.packet_count = 1;
 
 		if (!da_push_back(cache->gops, &gop)) {
 			obs_encoder_packet_release(&slot->packet);
+			slot->magic = 0;
 			pthread_mutex_unlock(&cache->mutex);
 			return;
 		}
-	} else {
-		cache_gop_at(cache, cache_gop_count(cache) - 1)->packet_count++;
 	}
 
-	slot->index = cache->next_index;
-	slot->magic = REPLAY_BUFFER_SLOT_LIVE;
-	cache->count++;
 	cache->next_index++;
 
-	if (cache->count == 1) {
+	if (cache_packet_count(cache) == 1) {
 		cache->first_dts_usec = packet->dts_usec;
 		cache->last_dts_usec = packet->dts_usec;
 	} else if (packet->dts_usec > cache->last_dts_usec) {
@@ -375,7 +380,8 @@ bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t 
 	return found;
 }
 
-/* Index of the last GOP whose keyframe is at or before time_usec. */
+/* Index of the first GOP whose keyframe is after time_usec (strict) or at/after
+ * it, as an absolute position in the gops array. */
 static size_t cache_gop_lower_bound(const replay_buffer_cache_t *cache, int64_t time_usec, bool strict)
 {
 	size_t low = cache->gops_head;
@@ -394,6 +400,22 @@ static size_t cache_gop_lower_bound(const replay_buffer_cache_t *cache, int64_t 
 	return low;
 }
 
+/* Nearest GOP to time_usec, preferring the earlier keyframe on a tie: it is
+ * never later than the requested time. */
+static size_t cache_nearest_gop(const replay_buffer_cache_t *cache, int64_t time_usec)
+{
+	size_t low = cache_gop_lower_bound(cache, time_usec, false);
+
+	if (low >= cache->gops.num)
+		return cache->gops.num - 1;
+	if (low == cache->gops_head)
+		return low;
+
+	const int64_t after = cache->gops.array[low].start_dts_usec - time_usec;
+	const int64_t before = time_usec - cache->gops.array[low - 1].start_dts_usec;
+	return before <= after ? low - 1 : low;
+}
+
 bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
 {
 	if (!cache || !index)
@@ -403,21 +425,7 @@ bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t tim
 	pthread_mutex_lock(&cache->mutex);
 
 	if (cache_gop_count(cache) > 0) {
-		size_t low = cache_gop_lower_bound(cache, time_usec, false);
-		size_t best;
-		if (low >= cache->gops.num) {
-			best = cache->gops.num - 1;
-		} else if (low == cache->gops_head) {
-			best = low;
-		} else {
-			const int64_t after = cache->gops.array[low].start_dts_usec - time_usec;
-			const int64_t before = time_usec - cache->gops.array[low - 1].start_dts_usec;
-			/* Prefer the earlier keyframe on a tie: it is never later than
-			 * the requested time. */
-			best = before <= after ? low - 1 : low;
-		}
-
-		*index = best - cache->gops_head;
+		*index = cache_nearest_gop(cache, time_usec) - cache->gops_head;
 		found = true;
 	}
 
@@ -469,10 +477,11 @@ static bool cache_resolve_range_locked(replay_buffer_cache_t *cache, int64_t sta
 	if (cache_gop_count(cache) == 0 || end_usec <= start_usec)
 		return false;
 
+	/* Start from the GOP that covers the requested start. */
 	const size_t after = cache_gop_lower_bound(cache, start_usec, true);
 	const size_t low = after > cache->gops_head ? after - 1 : cache->gops_head;
-
 	const struct replay_buffer_gop *gop = &cache->gops.array[low];
+
 	const int64_t aligned_start = gop->start_dts_usec;
 	if (aligned_start >= end_usec)
 		return false;
@@ -481,8 +490,8 @@ static bool cache_resolve_range_locked(replay_buffer_cache_t *cache, int64_t sta
 	int64_t actual_end = aligned_start;
 	uint64_t last = gop->first_index;
 
-	for (uint64_t index = gop->first_index;; index++) {
-		struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+	for (uint64_t index = gop->first_index; index < cache->next_index; index++) {
+		struct replay_buffer_packet *slot = cache_live_slot(cache, index);
 		if (!slot)
 			break;
 		if (slot->packet.dts_usec > end_usec)
@@ -549,7 +558,7 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
 
 	if (found) {
 		for (uint64_t index = first; index <= last; index++) {
-			struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+			struct replay_buffer_packet *slot = cache_live_slot(cache, index);
 			if (!slot)
 				break;
 
@@ -587,8 +596,9 @@ bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	if (cache_gop_count(cache) > 0) {
-		struct replay_buffer_packet *slot = cache_slot_for_index(cache, cache_gop_at(cache, 0)->first_index);
+	const size_t count = cache_gop_count(cache);
+	if (count > 0) {
+		struct replay_buffer_packet *slot = cache_live_slot(cache, cache_gop_at(cache, 0)->first_index);
 		if (slot) {
 			obs_encoder_packet_ref(packet, &slot->packet);
 			found = true;
@@ -608,21 +618,10 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	const size_t count = cache_gop_count(cache);
-	if (count > 0) {
-		size_t low = cache_gop_lower_bound(cache, time_usec, false);
-		size_t best;
-		if (low >= cache->gops.num) {
-			best = cache->gops.num - 1;
-		} else if (low == cache->gops_head) {
-			best = low;
-		} else {
-			const int64_t after = cache->gops.array[low].start_dts_usec - time_usec;
-			const int64_t before = time_usec - cache->gops.array[low - 1].start_dts_usec;
-			best = before <= after ? low - 1 : low;
-		}
+	if (cache_gop_count(cache) > 0) {
+		const size_t best = cache_nearest_gop(cache, time_usec);
+		struct replay_buffer_packet *slot = cache_live_slot(cache, cache->gops.array[best].first_index);
 
-		struct replay_buffer_packet *slot = cache_slot_for_index(cache, cache->gops.array[best].first_index);
 		if (slot && slot->packet.type == OBS_ENCODER_VIDEO && slot->packet.keyframe) {
 			obs_encoder_packet_ref(packet, &slot->packet);
 			*index = slot->index;
@@ -648,7 +647,7 @@ bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t in
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	struct replay_buffer_packet *slot = cache_slot_for_index(cache, index);
+	struct replay_buffer_packet *slot = cache_live_slot(cache, index);
 	if (slot) {
 		obs_encoder_packet_ref(packet, &slot->packet);
 		found = true;
@@ -666,31 +665,31 @@ bool replay_buffer_cache_find_packet(replay_buffer_cache_t *cache, int64_t time_
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	if (cache->count > 0) {
-		/* Absolute indices follow the buffer order, so a binary search over them
-		 * finds the packet closest to the requested time. */
+	if (cache_packet_count(cache) > 0) {
 		uint64_t low = cache->first_index;
-		uint64_t high = cache->first_index + cache->count - 1;
+		uint64_t high = cache->next_index - 1;
 
 		while (low < high) {
 			const uint64_t middle = low + (high - low) / 2;
-			struct replay_buffer_packet *slot = cache_slot_for_index(cache, middle);
-			if (!slot)
-				break;
+			struct replay_buffer_packet *slot = cache_live_slot(cache, middle);
+			if (!slot) {
+				low = middle + 1;
+				continue;
+			}
 			if (slot->packet.dts_usec < time_usec)
 				low = middle + 1;
 			else
 				high = middle;
 		}
 
-		struct replay_buffer_packet *slot = cache_slot_for_index(cache, low);
+		struct replay_buffer_packet *slot = cache_live_slot(cache, low);
 		if (!slot) {
 			pthread_mutex_unlock(&cache->mutex);
 			return false;
 		}
 
 		if (low > cache->first_index && slot->packet.dts_usec > time_usec) {
-			struct replay_buffer_packet *prev = cache_slot_for_index(cache, low - 1);
+			struct replay_buffer_packet *prev = cache_live_slot(cache, low - 1);
 			if (prev && time_usec - prev->packet.dts_usec < slot->packet.dts_usec - time_usec)
 				low--;
 		}
@@ -713,11 +712,15 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cach
 		return NULL;
 
 	pthread_mutex_lock(&cache->mutex);
-	da_reserve(snapshot->packets, cache->count);
+	da_reserve(snapshot->packets, cache_packet_count(cache));
 
-	for (size_t i = 0; i < cache->count; i++) {
+	for (uint64_t index = cache->first_index; index < cache->next_index; index++) {
+		struct replay_buffer_packet *slot = cache_live_slot(cache, index);
+		if (!slot)
+			continue;
+
 		struct encoder_packet packet;
-		obs_encoder_packet_ref(&packet, &cache_slot_at(cache, i)->packet);
+		obs_encoder_packet_ref(&packet, &slot->packet);
 		if (!da_push_back(snapshot->packets, &packet)) {
 			obs_encoder_packet_release(&packet);
 			pthread_mutex_unlock(&cache->mutex);
