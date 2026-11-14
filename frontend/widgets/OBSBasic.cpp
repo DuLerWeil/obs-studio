@@ -145,10 +145,12 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	 * windows never show it and it never covers the program output. */
 	auto *panel = new OBSReplayPanel(this, ui->preview);
 	replayPanel = panel;
-	ui->replayContainerLayout->addWidget(panel);
+	/* Added above the preview's own control row, as a direct item of the
+	 * preview column so no wrapper widget is needed. */
+	ui->previewXContainerLayout->insertWidget(0, panel);
 	/* The fold button sits at the right end of the preview's own control row,
 	 * next to the horizontal scroll bar. */
-	panel->SetCollapseButtonLayout(ui->horizontalLayout_7, ui->previewScalingMode);
+	panel->SetCollapseButtonLayout(ui->previewControlsLayout, ui->previewScalingMode);
 	connect(this, &OBSBasic::ReplayBufStarted, panel, &OBSReplayPanel::Start);
 	connect(this, &OBSBasic::ReplayBufStopping, panel, &OBSReplayPanel::Stop);
 	connect(this, &OBSBasic::ReplayBufStopped, panel, &OBSReplayPanel::Stop);

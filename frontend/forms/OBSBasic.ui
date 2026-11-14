@@ -261,34 +261,7 @@
                 <number>0</number>
                </property>
                <item>
-                <widget class="QWidget" name="replayContainer">
-                 <property name="sizePolicy">
-                  <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
-                   <horstretch>0</horstretch>
-                   <verstretch>0</verstretch>
-                  </sizepolicy>
-                 </property>
-                 <layout class="QVBoxLayout" name="replayContainerLayout">
-                  <property name="spacing">
-                   <number>0</number>
-                  </property>
-                  <property name="leftMargin">
-                   <number>0</number>
-                  </property>
-                  <property name="topMargin">
-                   <number>0</number>
-                  </property>
-                  <property name="rightMargin">
-                   <number>0</number>
-                  </property>
-                  <property name="bottomMargin">
-                   <number>0</number>
-                  </property>
-                 </layout>
-                </widget>
-               </item>
-               <item>
-                <layout class="QHBoxLayout" name="horizontalLayout_7">
+                <layout class="QHBoxLayout" name="previewControlsLayout">
                  <property name="spacing">
                   <number>0</number>
                  </property>
