@@ -1,9 +1,9 @@
 name: Scheduled
 run-name: Scheduled Repository Actions ⏰
 on:
+  # Scheduled runs are disabled in this fork: the nightly build, the static
+  # analysis and the cache cleanup now only run when dispatched by hand.
   workflow_dispatch:
-  schedule:
-    - cron: 17 0 * * *
 permissions:
   contents: write
 concurrency:
@@ -90,9 +90,17 @@ jobs:
               --jq '.actions_caches.[] | select(.ref|test("refs/heads/master")|not) | select(.key|test(".*-ccache-*")) | {id, key, ref} | join(";")')"
           echo '::endgroup::'
 
+  # Same build matrix switch as push.yaml: Windows x64 only unless the
+  # repository variables re-enable the other targets.
   build-project:
     name: Build 🧱
     uses: ./.github/workflows/build-project.yaml
+    with:
+      macos: ${{ vars.BUILD_MACOS == 'true' }}
+      ubuntu: ${{ vars.BUILD_UBUNTU == 'true' }}
+      flatpak: ${{ vars.BUILD_FLATPAK == 'true' }}
+      windows: ${{ vars.BUILD_WINDOWS != 'false' }}
+      windows_architectures: ${{ vars.BUILD_WINDOWS_ARCHITECTURES || '["x64"]' }}
     needs: cache-cleanup
     secrets: inherit
 
