@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QFontMetrics>
 #include <QImage>
+#include <QPoint>
 #include <QPointer>
 #include <QSize>
 #include <QTimer>
@@ -40,6 +41,9 @@ public:
 	void SetPosition(int64_t position_usec);
 	void SetSelection(int64_t start_usec, int64_t end_usec);
 	void ClearSelection();
+	/* Move the clip endpoint nearest to time_usec onto that exact moment. With no
+	 * clip yet this starts one at time_usec that runs to the live edge. */
+	void MoveSelectionEndpoint(int64_t time_usec);
 	/* Drop any wheel zoom and show the whole window again. */
 	void ResetZoom();
 	/* Pin the axis where it stands. While frozen the ruler slides to the right
@@ -60,6 +64,8 @@ signals:
 	/* Asked for by a double click in the part of the axis reserved past the
 	 * live edge, where there is no buffered frame to select. */
 	void GoLiveRequested();
+	/* Asked for by a double click on the playhead triangle itself. */
+	void MarkerDoubleClicked();
 
 protected:
 	void paintEvent(QPaintEvent *event) override;
@@ -74,6 +80,9 @@ protected:
 private:
 	int64_t RawTimeAt(int x) const;
 	int64_t TimeAt(int x) const;
+	/* True inside the playhead triangle plus a few pixels of slop, so a double
+	 * click on the marker is not confused with one on the axis. */
+	bool PlayheadHit(const QPoint &pos) const;
 	int TrackLeft() const;
 	int TrackWidth() const;
 	int64_t AxisStart() const;
@@ -94,6 +103,14 @@ private:
 
 	int64_t rangeStart_ = 0;
 	int64_t rangeEnd_ = 0;
+	/* Playhead position before the click that may turn out to be the first half
+	 * of a double click, so the pair can be undone. */
+	int64_t positionBeforePress_ = 0;
+	bool positionPressMoved_ = false;
+	/* The press that the double click follows landed on the marker. Kept from the
+	 * press, because the marker may have snapped elsewhere before the second
+	 * click arrived. */
+	bool pressHitMarker_ = false;
 	int64_t maxDuration_ = 0;
 	/* Wheel zoom: 0 means "fit the whole window". */
 	int64_t zoomSpan_ = 0;
@@ -104,6 +121,9 @@ private:
 	int64_t position_ = 0;
 	int64_t selectionStart_ = 0;
 	int64_t selectionEnd_ = 0;
+	/* The end is not a fixed moment: the clip runs from the start to the live
+	 * edge and has to keep tracking the buffer end as it rolls. */
+	bool selectionFollowsLive_ = false;
 	int64_t dragAnchor_ = 0;
 	bool draggingPosition_ = false;
 	bool draggingSelection_ = false;
@@ -139,6 +159,7 @@ private slots:
 	void RefreshInfo();
 	void PositionChanged(qint64 position_usec, bool finished);
 	void SelectionChanged(qint64 start_usec, qint64 end_usec);
+	void MarkerDoubleClicked();
 	void PollFullFrame();
 	void ToggleLivePause();
 	void GoLive();
@@ -218,6 +239,16 @@ private:
 	int64_t rangeStartUsec_ = 0;
 	int64_t rangeEndUsec_ = 0;
 	int64_t positionUsec_ = 0;
+	/* Keyframe the playhead and the selection start are parked on, as dts;
+	 * -1 means "no anchor" (following live, or nothing selected). A dropped
+	 * history makes the saved keyframe disappear while the times can still look
+	 * inside the window, so these are re-checked against the cache on refresh. */
+	int64_t positionAnchorUsec_ = -1;
+	int64_t selectionAnchorUsec_ = -1;
+	/* Selection start captured from the timeline, resolved to an anchor on the
+	 * next refresh instead of on every drag event. */
+	int64_t pendingSelectionStart_ = 0;
+	bool selectionAnchorPending_ = false;
 
 	uint64_t fullFrameRequestId_ = 0;
 	uint64_t pendingFullFrameId_ = 0;

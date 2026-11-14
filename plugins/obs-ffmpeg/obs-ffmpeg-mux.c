@@ -83,8 +83,6 @@ static void ffmpeg_mux_destroy(void *data)
 	 * cache after it was freed, which is where the buffer crashed on stop. */
 	if (stream->replay_buffer_mutex_initialized) {
 		pthread_mutex_lock(&stream->replay_buffer_mutex);
-		blog(LOG_INFO, "[replay buffer] destroy: cache %p, callbacks %d", (void *)stream->replay_cache,
-		     stream->replay_callbacks);
 		os_atomic_set_bool(&stream->active, false);
 		os_atomic_set_bool(&stream->stopping, false);
 		stream->replay_shutdown = true;
@@ -621,7 +619,20 @@ static void find_best_filename(struct dstr *path, bool space)
 	}
 }
 
-static void generate_filename(struct ffmpeg_muxer *stream, struct dstr *dst, bool overwrite)
+/* Inserts a marker before the extension, leaving the container the ffmpeg
+ * helper infers from the name intact ("Replay ....mkv" -> "Replay ..._trimmed.mkv"). */
+static void insert_filename_suffix(struct dstr *path, const char *suffix)
+{
+	if (!suffix || !*suffix)
+		return;
+
+	const char *slash = strrchr(path->array, '/');
+	const char *dot = strrchr(path->array, '.');
+	const size_t pos = (dot && (!slash || dot > slash)) ? (size_t)(dot - path->array) : path->len;
+	dstr_insert(path, pos, suffix);
+}
+
+static void generate_filename(struct ffmpeg_muxer *stream, struct dstr *dst, bool overwrite, const char *suffix)
 {
 	obs_data_t *settings = obs_output_get_settings(stream->output);
 	const char *dir = obs_data_get_string(settings, "directory");
@@ -636,6 +647,9 @@ static void generate_filename(struct ffmpeg_muxer *stream, struct dstr *dst, boo
 	if (dstr_end(dst) != '/')
 		dstr_cat_ch(dst, '/');
 	dstr_cat(dst, filename);
+	/* The marker goes in before the uniqueness pass, so a repeated export is
+	 * numbered like any other file instead of reusing a taken name. */
+	insert_filename_suffix(dst, suffix);
 
 	char *slash = strrchr(dst->array, '/');
 	if (slash) {
@@ -790,7 +804,7 @@ static bool send_new_filename(struct ffmpeg_muxer *stream, const char *filename)
 
 static bool prepare_split_file(struct ffmpeg_muxer *stream, struct encoder_packet *packet)
 {
-	generate_filename(stream, &stream->path, stream->allow_overwrite);
+	generate_filename(stream, &stream->path, stream->allow_overwrite, NULL);
 	info("Changing output file to '%s'", stream->path.array);
 
 	if (!send_new_filename(stream, stream->path.array)) {
@@ -1155,6 +1169,10 @@ static void export_replay_selection(void *data, calldata_t *cd)
 			result = REPLAY_BUFFER_EXPORT_ERR_BUSY;
 		} else {
 			stream->selection_export = true;
+			/* Only the GOPs the writer has not reached yet are protected; the
+			 * snapshot already holds its own references, but the buffered copy
+			 * must stay resolvable until it is written. */
+			replay_buffer_cache_set_pin(stream->replay_cache, actual_start, actual_end);
 			replay_buffer_prepare_packets(stream, snapshot);
 			blog(LOG_INFO, "[replay buffer] export: %zu packets for %.3fs - %.3fs", stream->mux_packets.num,
 			     (double)actual_start / 1000000.0, (double)actual_end / 1000000.0);
@@ -1162,7 +1180,9 @@ static void export_replay_selection(void *data, calldata_t *cd)
 
 			/* Write to a temporary file first so a failed export never
 			 * leaves a partial file behind. */
-			generate_filename(stream, &stream->selection_path, false);
+			/* A marker in the name keeps trimmed exports apart from whole-buffer
+			 * saves and from each other in the output folder. */
+			generate_filename(stream, &stream->selection_path, false, "_trimmed");
 			replay_buffer_make_temp_path(stream->selection_path.array, &stream->path);
 			os_unlink(stream->path.array);
 
@@ -1178,6 +1198,8 @@ static void export_replay_selection(void *data, calldata_t *cd)
 				os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_FAILED);
 				os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_WRITE);
 				os_atomic_set_bool(&stream->muxing, false);
+				/* No thread was started to release the protection for us. */
+				replay_buffer_cache_clear_pin(stream->replay_cache);
 				result = REPLAY_BUFFER_EXPORT_ERR_WRITE;
 			} else {
 				result = REPLAY_BUFFER_EXPORT_ERR_NONE;
@@ -1389,12 +1411,25 @@ static void *replay_buffer_mux_thread(void *data)
 		goto finish;
 	}
 
+	/* Publishing the watermark for every packet would take the cache lock at
+	 * packet rate; one update per 100 ms is far inside one GOP and enough for
+	 * eviction to keep up with the writer. */
+	bool have_pin_progress = false;
+	int64_t pin_progress_reported = 0;
+
 	for (size_t i = 0; i < stream->mux_packets.num; i++) {
 		struct encoder_packet *pkt = &stream->mux_packets.array[i];
 		if (!write_packet(stream, pkt)) {
 			warn("Could not write packet for file '%s'", stream->path.array);
 			error = true;
 			goto finish;
+		}
+
+		if (selection_export &&
+		    (!have_pin_progress || pkt->dts_usec - pin_progress_reported >= 100000)) {
+			pin_progress_reported = pkt->dts_usec;
+			have_pin_progress = true;
+			replay_buffer_cache_set_pin_progress(stream->replay_cache, pkt->dts_usec);
 		}
 	}
 
@@ -1446,6 +1481,10 @@ finish: {
 				   error ? REPLAY_BUFFER_EXPORT_ERR_WRITE : REPLAY_BUFFER_EXPORT_ERR_NONE);
 		os_atomic_set_long(&stream->export_state,
 				   error ? REPLAY_BUFFER_EXPORT_FAILED : REPLAY_BUFFER_EXPORT_DONE);
+		/* The export is over, whether it succeeded or not: everything that was
+		 * protected can now be retired by the normal rules. This is the backend
+		 * completion, not the UI watchdog. */
+		replay_buffer_cache_clear_pin(stream->replay_cache);
 	}
 
 	/* Only a whole-buffer save is a "replay saved": the frontend answers that
@@ -1544,7 +1583,7 @@ static bool replay_buffer_save(struct ffmpeg_muxer *stream)
 	signal_handler_signal(sh, "saving", &cd);
 	calldata_free(&cd);
 
-	generate_filename(stream, &stream->path, true);
+	generate_filename(stream, &stream->path, true, NULL);
 
 	stream->mux_thread_joinable = pthread_create(&stream->mux_thread, NULL, replay_buffer_mux_thread, stream) == 0;
 	if (!stream->mux_thread_joinable) {

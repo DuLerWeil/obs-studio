@@ -216,9 +216,6 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 			if (append_parameter_sets(codec_id, first.data, first.size, &captured)) {
 				extra_data = (uint8_t *)captured.array;
 				extra_size = captured.len;
-				blog(LOG_INFO,
-				     "[replay buffer] using %zu bytes of parameter sets from the first keyframe",
-				     extra_size);
 			}
 			obs_encoder_packet_release(&first);
 		}
@@ -287,8 +284,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	}
 
 	bool have_last = false;
-	int last_send_ret = 0;
-	int last_receive_ret = 0;
 
 	for (size_t i = 0; i < count; i++) {
 		if (!packets[i].data || !packets[i].size || packets[i].size > (size_t)INT_MAX)
@@ -312,7 +307,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 			av_packet->flags |= AV_PKT_FLAG_KEY;
 
 		const int send_ret = avcodec_send_packet(context, av_packet);
-		last_send_ret = send_ret;
 		av_packet_free(&av_packet);
 
 		if (send_ret < 0) {
@@ -322,7 +316,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 
 		for (;;) {
 			const int ret = avcodec_receive_frame(context, frame);
-			last_receive_ret = ret;
 			if (ret == 0) {
 				av_frame_unref(last);
 				av_frame_move_ref(last, frame);
@@ -356,7 +349,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 
 		for (;;) {
 			const int ret = avcodec_receive_frame(context, frame);
-			last_receive_ret = ret;
 			if (ret == 0) {
 				av_frame_unref(last);
 				av_frame_move_ref(last, frame);
@@ -369,8 +361,6 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	av_frame_free(&frame);
 
 	if (!have_last) {
-		blog(LOG_DEBUG, "[replay buffer] decode: no frame from %zu packets (last send %d, last receive %d)",
-		     count, last_send_ret, last_receive_ret);
 		av_frame_free(&last);
 		/* Some encoders only expose extradata after the first packet. If it
 		 * was missing, allow the next keyframe to reopen the decoder with the
@@ -469,9 +459,6 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 					 &width, &height);
 		for (size_t i = 0; i < count; i++)
 			obs_encoder_packet_release(&packets[i]);
-	} else {
-		blog(LOG_DEBUG, "[replay buffer] frame %llu: no video keyframe near %.3fs",
-		     (unsigned long long)request_id, (double)time_usec / 1000000.0);
 	}
 
 	pthread_mutex_lock(&frame_decoder->mutex);
@@ -492,9 +479,6 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 
 	if (rgba)
 		bfree(rgba);
-
-	blog(LOG_DEBUG, "[replay buffer] frame %llu: %s (%zu packets)", (unsigned long long)request_id,
-	     decoded ? "decoded" : "failed", count);
 }
 
 static void *frame_thread(void *param)
@@ -520,8 +504,6 @@ static void *frame_thread(void *param)
 		frame_decoder->has_request = false;
 		pthread_mutex_unlock(&frame_decoder->mutex);
 
-		blog(LOG_DEBUG, "[replay buffer] frame %llu: decoding at %.3fs", (unsigned long long)request_id,
-		     (double)time_usec / 1000000.0);
 		frame_process(frame_decoder, time_usec, request_id);
 	}
 

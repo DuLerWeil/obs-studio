@@ -55,6 +55,9 @@ constexpr int kTrackInset = 2;
 constexpr int kGrooveHeight = 4;
 constexpr int kMarkerHeight = 7;
 constexpr int kMarkHalfWidth = 4;
+/* Slop around the playhead triangle, so a double click on a 8 px wide marker is
+ * still recognised after a little mouse movement. */
+constexpr int kMarkerHitPadding = 8;
 constexpr int kTickHeight = 12;
 constexpr int kRulerMinSpacing = 80;
 /* Floor for the wheel zoom, so a notch cannot collapse the scale to nothing. */
@@ -130,6 +133,50 @@ QFont ScaleFont(const QFont &base)
 
 	font.setBold(true);
 	return font;
+}
+
+/* Keyframe at or before time_usec, reported as its dts; -1 when the window no
+ * longer holds one that early. Two lookups at most, and only when an anchor has
+ * to be established. */
+int64_t KeyframeAnchorAt(proc_handler_t *ph, int64_t time_usec)
+{
+	calldata_t cd = {0};
+	calldata_set_int(&cd, "time_usec", time_usec);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &cd);
+	int ordinal = (int)calldata_int(&cd, "ordinal");
+	int64_t dts = calldata_int(&cd, "dts_usec");
+	calldata_free(&cd);
+
+	/* The lookup returns the nearest keyframe, which may sit just after the
+	 * requested time; the one a clip actually starts on is the earlier one. */
+	if (ordinal >= 0 && dts <= time_usec)
+		return dts;
+
+	calldata_t prev = {0};
+	calldata_set_int(&prev, "time_usec", time_usec);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_PREV_KEYFRAME, &prev);
+	ordinal = (int)calldata_int(&prev, "ordinal");
+	dts = calldata_int(&prev, "dts_usec");
+	calldata_free(&prev);
+
+	return ordinal >= 0 ? dts : -1;
+}
+
+/* True when the keyframe remembered as an anchor is no longer buffered. The
+ * anchor is kept as a dts rather than an ordinal, because ordinals are relative
+ * to the oldest GOP and shift whenever history is dropped. A live anchor answers
+ * with its own dts; an evicted one answers with the next keyframe, or nothing at
+ * all once the cache is empty. */
+bool KeyframeAnchorEvicted(proc_handler_t *ph, int64_t anchor_usec)
+{
+	calldata_t cd = {0};
+	calldata_set_int(&cd, "time_usec", anchor_usec);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &cd);
+	const int ordinal = (int)calldata_int(&cd, "ordinal");
+	const int64_t dts = calldata_int(&cd, "dts_usec");
+	calldata_free(&cd);
+
+	return ordinal < 0 || dts != anchor_usec;
 }
 
 } // namespace
@@ -366,6 +413,22 @@ int64_t OBSReplayBufferTimeline::TimeAt(int x) const
 	return qBound(rangeStart_, RawTimeAt(x), rangeEnd_);
 }
 
+bool OBSReplayBufferTimeline::PlayheadHit(const QPoint &pos) const
+{
+	if (rangeEnd_ <= rangeStart_) {
+		return false;
+	}
+
+	const int markTop = AxisY() + kGrooveHeight / 2;
+	const int markBottom = markTop + kMarkerHeight;
+	const int x = XForTime(position_);
+
+	/* The triangle plus a symmetric slop on both axes; outside this box a double
+	 * click belongs to the clip endpoint gestures. */
+	return qAbs(pos.x() - x) <= kMarkHalfWidth + kMarkerHitPadding &&
+	       pos.y() >= markTop - kMarkerHitPadding && pos.y() <= markBottom + kMarkerHitPadding;
+}
+
 void OBSReplayBufferTimeline::SetFrozen(bool frozen)
 {
 	if (frozen_ == frozen) {
@@ -426,7 +489,18 @@ void OBSReplayBufferTimeline::SetRange(int64_t start_usec, int64_t end_usec)
 		}
 	}
 
-	if (selectionEnd_ > selectionStart_) {
+	if (selectionFollowsLive_) {
+		/* The clip ends at "now". Refresh the end from the buffer end every time
+		 * the window moves, otherwise the right side would stay at the moment
+		 * the clip was created and slide left as the buffer rolls. */
+		selectionEnd_ = rangeEnd_;
+		selectionStart_ = qBound(rangeStart_, selectionStart_, rangeEnd_);
+		if (selectionEnd_ <= selectionStart_) {
+			selectionStart_ = 0;
+			selectionEnd_ = 0;
+			selectionFollowsLive_ = false;
+		}
+	} else if (selectionEnd_ > selectionStart_) {
 		selectionStart_ = qBound(rangeStart_, selectionStart_, rangeEnd_);
 		selectionEnd_ = qBound(rangeStart_, selectionEnd_, rangeEnd_);
 		if (selectionEnd_ <= selectionStart_) {
@@ -456,6 +530,8 @@ void OBSReplayBufferTimeline::SetPosition(int64_t position_usec)
 
 void OBSReplayBufferTimeline::SetSelection(int64_t start_usec, int64_t end_usec)
 {
+	/* An explicit range, so it stops tracking the live edge. */
+	selectionFollowsLive_ = false;
 	selectionStart_ = qBound(rangeStart_, start_usec, rangeEnd_);
 	selectionEnd_ = qBound(rangeStart_, end_usec, rangeEnd_);
 	if (selectionEnd_ < selectionStart_) {
@@ -470,9 +546,55 @@ void OBSReplayBufferTimeline::SetSelection(int64_t start_usec, int64_t end_usec)
 
 void OBSReplayBufferTimeline::ClearSelection()
 {
+	selectionFollowsLive_ = false;
 	selectionStart_ = 0;
 	selectionEnd_ = 0;
 	update();
+}
+
+void OBSReplayBufferTimeline::MoveSelectionEndpoint(int64_t time_usec)
+{
+	const int64_t time = qBound(rangeStart_, time_usec, rangeEnd_);
+
+	if (!HasSelection()) {
+		/* No clip yet: the marker is the start, and the end stays live so the
+		 * clip keeps growing instead of ending where it was created. */
+		if (rangeEnd_ - time < kMinSelectionUsec) {
+			return;
+		}
+
+		selectionStart_ = time;
+		selectionEnd_ = rangeEnd_;
+		selectionFollowsLive_ = true;
+	} else {
+		/* Grab whichever end the playhead is closer to; a tie goes to the start,
+		 * which is the end most edits touch. */
+		const int64_t toStart = qAbs(time - selectionStart_);
+		const int64_t toEnd = qAbs(time - selectionEnd_);
+
+		if (toStart <= toEnd) {
+			const int64_t end = selectionFollowsLive_ ? rangeEnd_ : selectionEnd_;
+			if (end - time < kMinSelectionUsec) {
+				return;
+			}
+
+			/* Moving the start keeps a live clip live. */
+			selectionStart_ = time;
+			selectionEnd_ = end;
+		} else {
+			if (time - selectionStart_ < kMinSelectionUsec) {
+				return;
+			}
+
+			/* An explicitly placed end stops following the buffer, otherwise
+			 * SetRange would pull it back to the live edge on the next tick. */
+			selectionEnd_ = time;
+			selectionFollowsLive_ = false;
+		}
+	}
+
+	update();
+	emit SelectionChanged(selectionStart_, selectionEnd_);
 }
 
 void OBSReplayBufferTimeline::paintEvent(QPaintEvent *event)
@@ -586,6 +708,10 @@ void OBSReplayBufferTimeline::mousePressEvent(QMouseEvent *event)
 	/* Swallow the right press so the double click that follows is delivered to
 	 * this widget instead of bubbling up to the parent. */
 	if (event->button() == Qt::RightButton) {
+		/* A right press never seeks, so a later double click must not undo a seek
+		 * left over from an earlier left press. */
+		positionPressMoved_ = false;
+		pressHitMarker_ = false;
 		event->accept();
 		return;
 	}
@@ -607,14 +733,37 @@ void OBSReplayBufferTimeline::mousePressEvent(QMouseEvent *event)
 	if (event->modifiers() & Qt::ShiftModifier) {
 		draggingSelection_ = true;
 		dragAnchor_ = time;
-		selectionStart_ = time;
-		selectionEnd_ = time;
-		emit SelectionChanged(0, 0);
+		positionPressMoved_ = false;
+		pressHitMarker_ = false;
+		if (selectionFollowsLive_) {
+			/* The clip already ends at the live edge, so this drag moves the start
+			 * and the right side keeps tracking the buffer end. */
+			selectionStart_ = qMin(time, rangeEnd_);
+			selectionEnd_ = rangeEnd_;
+			emit SelectionChanged(selectionStart_, selectionEnd_);
+		} else {
+			selectionStart_ = time;
+			selectionEnd_ = time;
+			emit SelectionChanged(0, 0);
+		}
 	} else {
+		/* Remember where the playhead was: the first click of a double click has
+		 * already seeked, and the pair must be undone if a double click follows. */
+		positionBeforePress_ = position_;
+		positionPressMoved_ = true;
+		pressHitMarker_ = PlayheadHit(event->pos());
+
+		if (pressHitMarker_) {
+			/* Pressing the marker itself must not seek by the pixel or two the
+			 * click missed it by; a drag still moves it from the next event. */
+			positionPressMoved_ = false;
+		} else {
+			position_ = time;
+			update();
+			emit PositionChanged(position_, false);
+		}
+
 		draggingPosition_ = true;
-		position_ = time;
-		update();
-		emit PositionChanged(position_, false);
 	}
 }
 
@@ -634,8 +783,16 @@ void OBSReplayBufferTimeline::mouseMoveEvent(QMouseEvent *event)
 		emit PositionChanged(position_, false);
 	} else if (draggingSelection_) {
 		const int64_t time = TimeAt(event->pos().x());
-		selectionStart_ = std::min(dragAnchor_, time);
-		selectionEnd_ = std::max(dragAnchor_, time);
+		if (selectionFollowsLive_) {
+			/* Moving the start of a clip that ends at "now" must not turn it into
+			 * a fixed range; the end follows the buffer here too, not later on the
+			 * next info refresh. */
+			selectionStart_ = qMin(time, rangeEnd_);
+			selectionEnd_ = rangeEnd_;
+		} else {
+			selectionStart_ = std::min(dragAnchor_, time);
+			selectionEnd_ = std::max(dragAnchor_, time);
+		}
 		update();
 		emit SelectionChanged(selectionStart_, selectionEnd_);
 	} else if (!hovering_) {
@@ -677,6 +834,24 @@ void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 		return;
 	}
 
+	/* The first click of the pair has already seeked; a double click selects a
+	 * clip end and must not drag the playhead along with it. */
+	if (positionPressMoved_) {
+		positionPressMoved_ = false;
+		position_ = positionBeforePress_;
+		update();
+		emit PositionChanged(position_, true);
+	}
+
+	if (pressHitMarker_ || PlayheadHit(event->pos())) {
+		/* Double clicking the marker aligns a clip end to the keyframe the
+		 * playhead is on; the marker itself stays where it is. */
+		pressHitMarker_ = false;
+		emit MarkerDoubleClicked();
+		event->accept();
+		return;
+	}
+
 	/* The axis reserves room past "now" for the ruler to slide into; a click
 	 * there is not on the buffer, so it drives the live edge instead of the
 	 * clip selection. */
@@ -709,6 +884,9 @@ void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 
 		selectionStart_ = time;
 		selectionEnd_ = rangeEnd_;
+		/* Only the start was chosen: the clip runs to the live edge and keeps
+		 * growing with the buffer instead of ending at this instant. */
+		selectionFollowsLive_ = true;
 	} else if (event->button() == Qt::RightButton) {
 		/* Setting the end before the start is a normal way to work, so a clip
 		 * that has no start yet begins at the oldest buffered moment. */
@@ -721,6 +899,8 @@ void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 
 		selectionStart_ = start;
 		selectionEnd_ = time;
+		/* An end was chosen explicitly, so the clip is fixed from now on. */
+		selectionFollowsLive_ = false;
 	} else {
 		QWidget::mouseDoubleClickEvent(event);
 		return;
@@ -935,6 +1115,8 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	connect(timeline_, &OBSReplayBufferTimeline::PositionChanged, this, &OBSReplayBufferPanel::PositionChanged);
 	connect(timeline_, &OBSReplayBufferTimeline::SelectionChanged, this, &OBSReplayBufferPanel::SelectionChanged);
 	connect(timeline_, &OBSReplayBufferTimeline::GoLiveRequested, this, &OBSReplayBufferPanel::GoLive);
+	connect(timeline_, &OBSReplayBufferTimeline::MarkerDoubleClicked, this,
+		&OBSReplayBufferPanel::MarkerDoubleClicked);
 	connect(goLiveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::ToggleLivePause);
 	connect(prevButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::PreviousKeyframe);
 	connect(nextButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::NextKeyframe);
@@ -1167,7 +1349,6 @@ void OBSReplayBufferPanel::SetReviewFrame(const QImage &image)
 	reviewActive_ = true;
 	reviewClear_ = false;
 	reviewPending_ = frame;
-	blog(LOG_DEBUG, "[replay buffer] review: stored %dx%d frame", frame.width(), frame.height());
 }
 
 void OBSReplayBufferPanel::ClearReviewFrame()
@@ -1233,7 +1414,6 @@ void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 		const uint8_t *data = pending.constBits();
 		reviewTexture_ =
 			gs_texture_create((uint32_t)pending.width(), (uint32_t)pending.height(), GS_RGBA, 1, &data, 0);
-		blog(LOG_DEBUG, "[replay buffer] review: uploaded %dx%d frame", pending.width(), pending.height());
 	}
 
 	if (!reviewTexture_ || !cx || !cy) {
@@ -1319,6 +1499,9 @@ void OBSReplayBufferPanel::HidePanel()
 	exportRunning_ = false;
 	followLive_ = true;
 	positionUsec_ = 0;
+	positionAnchorUsec_ = -1;
+	selectionAnchorUsec_ = -1;
+	selectionAnchorPending_ = false;
 	timeline_->SetMaxDuration(0);
 	exportAction_->setEnabled(false);
 
@@ -1435,6 +1618,9 @@ void OBSReplayBufferPanel::RefreshInfo()
 		rangeStartUsec_ = 0;
 		rangeEndUsec_ = 0;
 		positionUsec_ = 0;
+		positionAnchorUsec_ = -1;
+		selectionAnchorUsec_ = -1;
+		selectionAnchorPending_ = false;
 		timeline_->SetMaxDuration(maxTime);
 		timeline_->SetRange(0, 0);
 		timeline_->SetPosition(0);
@@ -1452,13 +1638,66 @@ void OBSReplayBufferPanel::RefreshInfo()
 
 	if (followLive_) {
 		positionUsec_ = rangeEndUsec_;
+		positionAnchorUsec_ = -1;
 	} else if (positionUsec_ < rangeStartUsec_ || positionUsec_ > rangeEndUsec_) {
 		/* The rolling window dropped the moment being reviewed. Follow live again
 		 * and bring the axis back to the live window, instead of leaving a zoom
 		 * parked somewhere in the past. */
 		positionUsec_ = rangeEndUsec_;
 		followLive_ = true;
+		positionAnchorUsec_ = -1;
 		resetZoom = true;
+	} else if (positionAnchorUsec_ >= 0 && KeyframeAnchorEvicted(ph, positionAnchorUsec_)) {
+		/* The moment can still look inside the window while the keyframe it was
+		 * snapped to has already been dropped; the picture under the playhead is
+		 * no longer that moment. Treat it exactly like the position rolling out. */
+		positionUsec_ = rangeEndUsec_;
+		followLive_ = true;
+		positionAnchorUsec_ = -1;
+		resetZoom = true;
+	}
+
+	if (timeline_->HasSelection()) {
+		/* The start's keyframe is resolved here, once, instead of on every drag
+		 * event. Turning a start into an anchor on the refresh that follows the
+		 * change keeps the cost to a lookup per second at most. */
+		if (selectionAnchorPending_) {
+			selectionAnchorUsec_ = KeyframeAnchorAt(ph, pendingSelectionStart_);
+			selectionAnchorPending_ = false;
+		}
+
+		/* While an export runs the cache pauses eviction, so there is nothing to
+		 * follow and the clip has to stay exactly as it is. */
+		if (!exportRunning_) {
+			const int64_t endAnchor = KeyframeAnchorAt(ph, timeline_->SelectionEnd());
+			const bool startLost =
+				selectionAnchorUsec_ < 0 || KeyframeAnchorEvicted(ph, selectionAnchorUsec_);
+
+			if (startLost) {
+				/* The GOP the start sat on rolled out. Instead of dropping the
+				 * clip, follow the keyframes that survive: the oldest buffered
+				 * one is the next survivor, and it is also exactly what an
+				 * export snaps a start to, so both stay on the same frame. */
+				selectionAnchorUsec_ = KeyframeAnchorAt(ph, rangeStartUsec_);
+			}
+
+			if (startLost && (selectionAnchorUsec_ < 0 || endAnchor < 0 ||
+					  selectionAnchorUsec_ == endAnchor)) {
+				/* The start has caught up with the end: both now resolve to the
+				 * same keyframe, so the clip has collapsed and is no longer
+				 * exportable. Only then does the panel return to live. */
+				timeline_->ClearSelection();
+				selectionAnchorUsec_ = -1;
+				selectionAnchorPending_ = false;
+				positionUsec_ = rangeEndUsec_;
+				followLive_ = true;
+				positionAnchorUsec_ = -1;
+				resetZoom = true;
+			}
+		}
+	} else {
+		selectionAnchorUsec_ = -1;
+		selectionAnchorPending_ = false;
 	}
 
 	/* The axis is built from the configured limit, not from the length that
@@ -1468,11 +1707,8 @@ void OBSReplayBufferPanel::RefreshInfo()
 	if (resetZoom)
 		timeline_->ResetZoom();
 	timeline_->SetPosition(positionUsec_);
-	/* A clip that reaches the live edge keeps growing with the buffer; the
-	 * timeline owns the selection, so nothing is mirrored here. */
-	if (timeline_->HasSelection() && timeline_->SelectionEnd() >= rangeEndUsec_ - 1000000) {
-		timeline_->SetSelection(timeline_->SelectionStart(), rangeEndUsec_);
-	}
+	/* The timeline keeps a clip that ends at the live edge pinned to it; nothing
+	 * is mirrored here, and an explicit end stays where the user put it. */
 
 	UpdateLabels();
 	UpdateControls();
@@ -1576,6 +1812,10 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	}
 
 	positionUsec_ = qBound(rangeStartUsec_, position_usec, rangeEndUsec_);
+	if (!finished) {
+		/* The playhead is under the cursor, not parked on a keyframe. */
+		positionAnchorUsec_ = -1;
+	}
 	const bool wasFollowingLive = followLive_;
 	followLive_ = positionUsec_ >= rangeEndUsec_ - 200000;
 	if (!wasFollowingLive && followLive_) {
@@ -1594,7 +1834,6 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	 * plugin keeps only the newest request, so a short throttle is enough to
 	 * keep the decoder from being flooded. */
 	if (finished) {
-		blog(LOG_DEBUG, "[replay buffer] review %.3fs", (double)positionUsec_ / 1000000.0);
 		RequestFrame();
 	} else if (!fullFramePending_) {
 		/* Ask for the next frame as soon as the previous one arrived. The plugin
@@ -1607,8 +1846,17 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 
 void OBSReplayBufferPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
 {
-	Q_UNUSED(start_usec);
 	Q_UNUSED(end_usec);
+
+	/* Resolve the start's keyframe on the next info refresh, not on every drag
+	 * event; a cleared clip drops the anchor immediately. */
+	if (timeline_->HasSelection()) {
+		pendingSelectionStart_ = start_usec;
+		selectionAnchorPending_ = true;
+	} else {
+		selectionAnchorUsec_ = -1;
+		selectionAnchorPending_ = false;
+	}
 
 	/* The timeline already holds the selection; only the button state depends on
 	 * it, and the export resolves the range against the cache. */
@@ -1639,16 +1887,19 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 	calldata_free(&query);
 
 	if (ordinal < 0) {
-		blog(LOG_DEBUG, "[replay buffer] review %.3fs: no keyframe at this position",
-		     (double)positionUsec_ / 1000000.0);
 		/* Nothing decodable at this position; drop the stale frame so the
 		 * canvas falls back to the live picture, and cancel the request that is
 		 * still in flight so it cannot paint the previous position later. */
 		CancelFullFrame();
 		ClearReviewFrame();
 		SetReviewStale(false);
+		positionAnchorUsec_ = -1;
 		return;
 	}
+
+	/* Remember which keyframe the playhead is parked on. Mid-drag the playhead
+	 * follows the cursor, so there is no anchor to keep until the click settles. */
+	positionAnchorUsec_ = snap ? dts : -1;
 
 	/* A released click lands on the keyframe whose picture is shown; mid-drag the
 	 * playhead stays under the cursor. */
@@ -1689,7 +1940,6 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 	calldata_free(&cd);
 
 	if (!accepted) {
-		blog(LOG_DEBUG, "[replay buffer] review: the decoder refused the request");
 		SetReviewStale(true);
 		return;
 	}
@@ -1697,7 +1947,6 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 	fullFramePending_ = true;
 	pendingFullFrameId_ = requestId;
 
-	blog(LOG_DEBUG, "[replay buffer] review: decode request %llu queued", (unsigned long long)requestId);
 	fullFrameElapsed_.restart();
 	fullFrameTimer_.start();
 }
@@ -1749,8 +1998,6 @@ void OBSReplayBufferPanel::PollFullFrame()
 		return;
 	}
 
-	blog(LOG_DEBUG, "[replay buffer] review: copy status %d %dx%d (%lld bytes)", status, width, height, size);
-
 	fullFrameTimer_.stop();
 	fullFramePending_ = false;
 
@@ -1776,7 +2023,6 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_free(&copy);
 
 	if (copyStatus != REPLAY_BUFFER_FRAME_READY || copied <= 0) {
-		blog(LOG_DEBUG, "[replay buffer] review: copy returned status %d (%lld bytes)", copyStatus, copied);
 		SetReviewStale(true);
 		return;
 	}
@@ -1786,8 +2032,6 @@ void OBSReplayBufferPanel::PollFullFrame()
 	if (Reviewing()) {
 		SetReviewStale(false);
 		SetReviewFrame(image);
-	} else {
-		blog(LOG_DEBUG, "[replay buffer] review: frame ready but the panel is not reviewing");
 	}
 }
 
@@ -1799,6 +2043,7 @@ void OBSReplayBufferPanel::GoLive()
 
 	positionUsec_ = rangeEndUsec_;
 	followLive_ = true;
+	positionAnchorUsec_ = -1;
 	/* Going live restores the whole scale as well as the playhead. */
 	timeline_->ResetZoom();
 	timeline_->SetPosition(positionUsec_);
@@ -1860,6 +2105,39 @@ void OBSReplayBufferPanel::NextKeyframe()
 	}
 
 	JumpTo(dts);
+}
+
+void OBSReplayBufferPanel::MarkerDoubleClicked()
+{
+	if (!visible_ || !Active() || exportRunning_) {
+		return;
+	}
+
+	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	if (!output) {
+		return;
+	}
+
+	proc_handler_t *ph = obs_output_get_proc_handler(output);
+
+	/* Same keyframe the review frame would snap to, so the clip end lands on a
+	 * decodable boundary rather than the exact pixel under the marker. */
+	calldata_t cd = {0};
+	calldata_set_int(&cd, "time_usec", positionUsec_);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &cd);
+	const int ordinal = (int)calldata_int(&cd, "ordinal");
+	const int64_t dts = calldata_int(&cd, "dts_usec");
+	calldata_free(&cd);
+
+	if (ordinal < 0) {
+		/* The keyframe may have rolled out between the last refresh and this
+		 * click; report it instead of silently doing nothing. */
+		QMessageBox::warning(main_, QTStr("Basic.Main.Preview.ReplayBuffer.Title"),
+				     QTStr("Basic.Main.Preview.ReplayBuffer.KeyframeUnavailable"));
+		return;
+	}
+
+	timeline_->MoveSelectionEndpoint(dts);
 }
 
 void OBSReplayBufferPanel::JumpTo(int64_t position_usec)
@@ -1943,6 +2221,10 @@ void OBSReplayBufferPanel::ExportSelection()
 
 	/* Show the range the cache actually snapped to. */
 	timeline_->SetSelection(actualStart, actualEnd);
+	/* The export start is a keyframe; remember it so a later eviction is noticed
+	 * even though SetSelection does not emit SelectionChanged. */
+	selectionAnchorUsec_ = actualStart;
+	selectionAnchorPending_ = false;
 
 	exportRunning_ = true;
 	exportElapsed_.restart();
@@ -2013,8 +2295,11 @@ void OBSReplayBufferPanel::PollExport()
 	const std::string path = lastPath ? lastPath : "";
 	calldata_free(&pathCd);
 
-	QMessageBox::information(main_, QTStr("Basic.Main.Preview.ReplayBuffer.Title"),
-				 QTStr("Basic.Main.Preview.ReplayBuffer.ExportDone").arg(QT_UTF8(path.c_str())));
+	/* Reported in the status bar like a whole-buffer save, but without going
+	 * through ReplayBufferSaved(): that slot also raises the frontend event and
+	 * starts AutoRemux, and a trimmed export must not trigger either. */
+	main_->ShowStatusBarMessage(
+		QTStr("Basic.StatusBar.ReplayBufferSelectionSavedTo").arg(QT_UTF8(path.c_str())));
 }
 
 void OBSReplayBufferPanel::ShowExportError(int error)
@@ -2037,5 +2322,8 @@ void OBSReplayBufferPanel::ShowExportError(int error)
 		break;
 	}
 
-	QMessageBox::warning(main_, QTStr("Basic.Main.Preview.ReplayBuffer.Title"), message);
+	/* A failed selection export is reported in the status bar as well, so it
+	 * never blocks the preview with a modal dialog. The reason stays the same
+	 * wording the dialog used. */
+	main_->ShowStatusBarMessage(QTStr("Basic.StatusBar.ReplayBufferSelectionFailed").arg(message));
 }

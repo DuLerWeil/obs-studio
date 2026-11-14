@@ -18,10 +18,18 @@
  *
  * Limits are soft by design:
  *   - max_size_bytes / max_time_usec <= 0 means "no limit";
- *   - at least two GOPs are always retained, so the buffered window can exceed
- *     the configured limits by up to two GOPs;
+ *   - max_time_usec is a coverage guarantee as well: one extra GOP is retained
+ *     behind it so the exposed window always starts on a keyframe that is at
+ *     or before end - max_time. The retained history can therefore exceed the
+ *     time limit by up to one GOP (its length measured from the buffered
+ *     keyframes, so a changed interval adapts immediately);
+ *   - at least two GOPs are always retained, so a very short time limit
+ *     degrades to roughly one GOP of history instead of an empty window;
  *   - max_size_bytes counts packet payload only, not the per-slot and per-block
- *     bookkeeping.
+ *     bookkeeping. A tight size limit wins over the time coverage;
+ *   - a running selection export pins the GOPs it has not written yet, so the
+ *     limits are only exceeded by that backlog; already written history is
+ *     retired normally.
  */
 
 struct replay_buffer_keyframe_info {
@@ -37,6 +45,9 @@ struct replay_buffer_keyframe_info {
 /* One consistent snapshot of the cache counters. All fields are read under the
  * cache lock, so they describe the same instant. */
 struct replay_buffer_cache_info {
+	/* Oldest moment the window exposes. Clamped to end_usec - max_time_usec
+	 * when a time limit is configured: the GOP kept behind that moment exists
+	 * only so the limit can be cut on a keyframe, not to extend the window. */
 	int64_t start_usec;
 	int64_t end_usec;
 	int64_t max_size_bytes;
@@ -64,6 +75,16 @@ void replay_buffer_cache_destroy(replay_buffer_cache_t *cache);
 /* Updates the limits. Called when the output starts. <= 0 disables the
  * corresponding limit. */
 void replay_buffer_cache_set_limits(replay_buffer_cache_t *cache, int64_t max_size_bytes, int64_t max_time_usec);
+
+/* Protects the GOPs an export still has to write. Packets in [start_usec,
+ * end_usec] stay buffered until the writer's watermark passes them; everything
+ * already written keeps following the normal limits. */
+void replay_buffer_cache_set_pin(replay_buffer_cache_t *cache, int64_t start_usec, int64_t end_usec);
+/* Advances the export write watermark (throttled by the mux thread). Trims
+ * whatever the protection no longer needs. */
+void replay_buffer_cache_set_pin_progress(replay_buffer_cache_t *cache, int64_t dts_usec);
+/* Removes the protection and trims once. Safe to call when nothing is pinned. */
+void replay_buffer_cache_clear_pin(replay_buffer_cache_t *cache);
 
 /* Drops all packets and keyframes, keeping the configured limits. Also resets
  * the drop counters and waits for a new video keyframe again. */

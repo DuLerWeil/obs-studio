@@ -77,6 +77,15 @@ struct replay_buffer_cache {
 	uint64_t dropped_bytes;
 	uint64_t dropped_keyframes;
 	uint64_t push_failures;
+
+	/* Protection for a running selection export: GOPs in [pin_start, pin_end]
+	 * that the writer has not reached yet cannot be retired, while everything
+	 * already written keeps following the normal limits. */
+	bool pin_active;
+	int64_t pin_start_usec;
+	int64_t pin_end_usec;
+	/* Write watermark of the export, advanced by the mux thread. */
+	int64_t pin_progress_usec;
 };
 
 struct replay_buffer_snapshot {
@@ -254,8 +263,35 @@ static void cache_drop_front_gop(replay_buffer_cache_t *cache)
 	}
 }
 
+/* True when the front GOP still holds packets the running selection export has
+ * not written yet. GOPs that end before the export start are not part of it and
+ * stay evictable. */
+static bool cache_front_gop_pinned(const replay_buffer_cache_t *cache)
+{
+	const int64_t gop_start = cache_gop_at(cache, 0)->start_dts_usec;
+	if (gop_start < cache->pin_start_usec || gop_start > cache->pin_end_usec)
+		return false;
+
+	const int64_t gop_end = cache_gop_count(cache) > 1 ? cache_gop_at(cache, 1)->start_dts_usec
+							   : cache->last_dts_usec;
+	return gop_end > cache->pin_progress_usec;
+}
+
 /* Two GOPs are always kept: one to serve as the start of an export, one to hold
- * whatever is being written right now. */
+ * whatever is being written right now.
+ *
+ * The time limit is a coverage guarantee, not just a bound on the retained
+ * window: a GOP may only be retired when the next keyframe is itself at or
+ * before "end - max_time". Dropping as soon as the front GOP crossed the limit
+ * (the obvious rule) leaves the oldest keyframe up to one GOP short of the
+ * window, so the exposed start jumps forward by a whole GOP at every eviction
+ * and a full-window export comes out a few seconds short.
+ *
+ * The extra GOP is measured from the buffered keyframes themselves - the gap to
+ * the next one - so a changed keyframe interval takes effect on the next pushed
+ * packet instead of lingering in a stored maximum. Retention can never exceed
+ * max_time plus the length of the oldest GOP, and a very long GOP only defers
+ * eviction as long as coverage needs it. */
 static void cache_trim(replay_buffer_cache_t *cache)
 {
 	const bool have_size_limit = cache->max_size_bytes > 0;
@@ -265,10 +301,17 @@ static void cache_trim(replay_buffer_cache_t *cache)
 
 	while (cache_gop_count(cache) > 2) {
 		const bool over_size = have_size_limit && cache->total_size > cache->max_size_bytes;
+		/* Safe to retire the front GOP once the second one still reaches back to
+		 * the configured window. */
 		const bool over_time = have_time_limit &&
-				       (cache->last_dts_usec - cache_gop_at(cache, 0)->start_dts_usec) >
+				       (cache->last_dts_usec - cache_gop_at(cache, 1)->start_dts_usec) >=
 					       cache->max_time_usec;
 		if (!over_size && !over_time)
+			break;
+
+		/* A GOP the running export still has to write must stay buffered;
+		 * written ones are retired by the same rules as everything else. */
+		if (cache->pin_active && cache_front_gop_pinned(cache))
 			break;
 
 		const size_t before = cache_gop_count(cache);
@@ -319,6 +362,51 @@ void replay_buffer_cache_set_limits(replay_buffer_cache_t *cache, int64_t max_si
 	pthread_mutex_unlock(&cache->mutex);
 }
 
+void replay_buffer_cache_set_pin(replay_buffer_cache_t *cache, int64_t start_usec, int64_t end_usec)
+{
+	if (!cache)
+		return;
+
+	pthread_mutex_lock(&cache->mutex);
+	cache->pin_active = true;
+	cache->pin_start_usec = start_usec;
+	cache->pin_end_usec = end_usec;
+	/* Nothing has been written yet; GOPs before the start are not part of the
+	 * export and remain evictable. */
+	cache->pin_progress_usec = start_usec;
+	pthread_mutex_unlock(&cache->mutex);
+}
+
+void replay_buffer_cache_set_pin_progress(replay_buffer_cache_t *cache, int64_t dts_usec)
+{
+	if (!cache)
+		return;
+
+	pthread_mutex_lock(&cache->mutex);
+	if (cache->pin_active && dts_usec > cache->pin_progress_usec) {
+		cache->pin_progress_usec = dts_usec;
+		/* Retire what has just been written right away instead of waiting for
+		 * the next pushed packet; the caller throttles these updates. */
+		cache_trim(cache);
+	}
+	pthread_mutex_unlock(&cache->mutex);
+}
+
+void replay_buffer_cache_clear_pin(replay_buffer_cache_t *cache)
+{
+	if (!cache)
+		return;
+
+	pthread_mutex_lock(&cache->mutex);
+	if (cache->pin_active) {
+		cache->pin_active = false;
+		/* One catch-up pass: the writer may have left the history far over the
+		 * limit, and there is no reason to let it trickle out one GOP at a time. */
+		cache_trim(cache);
+	}
+	pthread_mutex_unlock(&cache->mutex);
+}
+
 void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 {
 	if (!cache)
@@ -338,6 +426,7 @@ void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 	cache->last_dts_usec = 0;
 	cache->total_size = 0;
 	cache->need_keyframe = true;
+	cache->pin_active = false;
 	cache->dropped_packets = 0;
 	cache->dropped_bytes = 0;
 	cache->dropped_keyframes = 0;
@@ -440,6 +529,21 @@ bool replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 	return true;
 }
 
+/* Oldest moment the window exposes. The cache keeps one extra GOP behind the
+ * configured limit, but that surplus is only there to make the limit reachable
+ * from a keyframe: showing it would make the buffer read as longer than the
+ * configured length. */
+static int64_t cache_window_start_usec(const replay_buffer_cache_t *cache)
+{
+	if (cache->max_time_usec > 0) {
+		const int64_t window_start = cache->last_dts_usec - cache->max_time_usec;
+		if (window_start > cache->first_dts_usec)
+			return window_start;
+	}
+
+	return cache->first_dts_usec;
+}
+
 void replay_buffer_cache_get_info(replay_buffer_cache_t *cache, struct replay_buffer_cache_info *info)
 {
 	if (!info)
@@ -451,7 +555,7 @@ void replay_buffer_cache_get_info(replay_buffer_cache_t *cache, struct replay_bu
 
 	pthread_mutex_lock(&cache->mutex);
 
-	info->start_usec = cache->first_dts_usec;
+	info->start_usec = cache_window_start_usec(cache);
 	info->end_usec = cache->last_dts_usec;
 	info->max_size_bytes = cache->max_size_bytes;
 	info->max_time_usec = cache->max_time_usec;
@@ -472,7 +576,7 @@ bool replay_buffer_cache_get_time_range(replay_buffer_cache_t *cache, int64_t *s
 		return false;
 
 	pthread_mutex_lock(&cache->mutex);
-	*start_usec = cache->first_dts_usec;
+	*start_usec = cache_window_start_usec(cache);
 	*end_usec = cache->last_dts_usec;
 	pthread_mutex_unlock(&cache->mutex);
 
@@ -764,12 +868,6 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 	}
 
 	pthread_mutex_unlock(&cache->mutex);
-
-	if (found) {
-		blog(LOG_DEBUG, "[replay buffer] keyframe at index %llu (dts %.3fs, requested %.3fs)",
-		     (unsigned long long)*packet_index, (double)packet->dts_usec / 1000000.0,
-		     (double)time_usec / 1000000.0);
-	}
 
 	return found;
 }

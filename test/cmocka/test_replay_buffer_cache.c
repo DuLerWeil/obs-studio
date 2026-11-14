@@ -504,6 +504,399 @@ static void test_block_growth_and_eviction(void **state)
 	replay_buffer_cache_destroy(cache);
 }
 
+/* Every exposed window has to start on a keyframe, and that keyframe has to
+ * reach back over the whole configured length. Both invariants are checked
+ * after every push, so an eviction that lands on the wrong side of the limit is
+ * caught as soon as it happens. */
+static void assert_window_covers_limit(replay_buffer_cache_t *cache, int64_t max_time_usec, int64_t frame_usec)
+{
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+
+	if (info.end_usec < max_time_usec)
+		return;
+
+	/* The configured value is the window length; the extra GOP the cache keeps
+	 * is not allowed to show up as a longer scale. */
+	assert_int_equal(info.end_usec - info.start_usec, max_time_usec);
+
+	struct replay_buffer_keyframe_info oldest = {0};
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_true(oldest.dts_usec <= info.start_usec);
+
+	/* The oldest GOP can overshoot the limit, but by no more than its own
+	 * length: eviction waits for the next keyframe to cross the limit. */
+	if (info.keyframe_count > 2) {
+		const int64_t retained = info.end_usec - oldest.dts_usec;
+		assert_true(retained < max_time_usec + oldest.duration_usec + frame_usec);
+	}
+
+	/* Exporting the displayed window has to yield at least the configured
+	 * length, even though the start snaps back to the older keyframe. */
+	int64_t actual_start = 0;
+	int64_t actual_end = 0;
+	assert_true(replay_buffer_cache_resolve_range(cache, info.start_usec, info.end_usec, &actual_start, &actual_end));
+	assert_true(actual_end - actual_start >= max_time_usec);
+}
+
+static void test_full_window_stays_stable_and_exports_full_length(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	const int64_t max_time_usec = 60 * 1000000LL;
+	const int64_t gop_usec = 4000000;
+	const int64_t frame_usec = 100000;
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, max_time_usec);
+
+	bool have_previous = false;
+	int64_t previous_start = 0;
+
+	for (int64_t t = 0; t <= 100 * 1000000LL; t += frame_usec) {
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, (t % gop_usec) == 0, t, 100, false));
+		assert_window_covers_limit(cache, max_time_usec, frame_usec);
+
+		struct replay_buffer_cache_info info = {0};
+		replay_buffer_cache_get_info(cache, &info);
+
+		/* Once full, the left edge advances with the buffer one frame at a
+		 * time. Dropping the whole front GOP as soon as it crossed the limit
+		 * made it jump backwards by that GOP every few seconds. */
+		if (have_previous && info.end_usec >= max_time_usec) {
+			assert_true(info.start_usec >= previous_start);
+			assert_true(info.start_usec - previous_start <= frame_usec);
+		}
+		have_previous = true;
+		previous_start = info.start_usec;
+	}
+
+	/* Only the configured length is exposed, not the surplus GOP. */
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.end_usec - info.start_usec, max_time_usec);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+/* The keyframe interval is not fixed, so the extra GOP has to follow whatever
+ * the encoder is doing right now instead of a remembered maximum. */
+static void test_gop_interval_change_adapts(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	const int64_t max_time_usec = 20 * 1000000LL;
+	const int64_t frame_usec = 100000;
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, max_time_usec);
+
+	bool saw_wide_gop = false;
+
+	for (int64_t t = 0; t <= 70 * 1000000LL; t += frame_usec) {
+		/* 2 s GOPs up to 24 s, then 8 s GOPs (32/40/48), then 1 s GOPs. */
+		bool keyframe;
+		if (t <= 24000000)
+			keyframe = (t % 2000000) == 0;
+		else if (t <= 48000000)
+			keyframe = (t % 8000000) == 0;
+		else
+			keyframe = (t % 1000000) == 0;
+
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, keyframe, t, 100, false));
+		assert_window_covers_limit(cache, max_time_usec, frame_usec);
+
+		if (t >= 42000000 && t <= 46000000) {
+			struct replay_buffer_keyframe_info oldest = {0};
+			assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+			if (oldest.duration_usec >= 8000000)
+				saw_wide_gop = true;
+		}
+	}
+
+	/* The 8 s GOPs were the head for a while, which is what the old rule would
+	 * have kept over-retaining after the interval shrank again. */
+	assert_true(saw_wide_gop);
+
+	/* By now the 1 s GOPs are at the front, so retention is back to about the
+	 * configured length plus one short GOP. */
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	struct replay_buffer_keyframe_info oldest = {0};
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_true(oldest.duration_usec <= 1100000);
+	assert_true(info.end_usec - oldest.dts_usec < max_time_usec + 1100000);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+/* A limit shorter than a GOP cannot be covered by a fractional GOP, so the
+ * window degrades to the two-GOP floor without losing the start keyframe. */
+static void test_small_max_time_degrades_to_gop_floor(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	const int64_t gop_usec = 4000000;
+	const int64_t frame_usec = 100000;
+	const int64_t limits[] = {5000000, 1000000};
+
+	for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+		const int64_t max_time_usec = limits[i];
+
+		replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+		assert_non_null(cache);
+		replay_buffer_cache_set_limits(cache, 0, max_time_usec);
+
+		for (int64_t t = 0; t <= 20 * 1000000LL; t += frame_usec) {
+			assert_true(push_packet(cache, OBS_ENCODER_VIDEO, (t % gop_usec) == 0, t, 100, false));
+			assert_window_covers_limit(cache, max_time_usec, frame_usec);
+		}
+
+		struct replay_buffer_cache_info info = {0};
+		replay_buffer_cache_get_info(cache, &info);
+		assert_int_equal(info.end_usec - info.start_usec, max_time_usec);
+		/* The floor is what keeps a keyframe available for the export. */
+		assert_true(info.keyframe_count >= 2);
+
+		replay_buffer_cache_destroy(cache);
+	}
+}
+
+/* The eviction check used by the timeline: a keyframe remembered by its dts
+ * resolves to that same dts while it is buffered, and to the next keyframe (or
+ * nothing) once history has rolled past it. */
+static void test_evicted_anchor_stops_resolving(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, 2000000);
+
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 0, 100, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 1000000, 100, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 2000000, 100, false);
+
+	size_t ordinal = 0;
+	struct replay_buffer_keyframe_info info = {0};
+
+	/* While the anchor is buffered, the lookup answers with the anchor itself. */
+	assert_true(replay_buffer_cache_find_keyframe(cache, 0, &ordinal));
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, ordinal, &info));
+	assert_int_equal(info.dts_usec, 0);
+
+	/* The 3s keyframe makes the 0s GOP roll out: the same lookup now answers with
+	 * a newer keyframe, which is what marks the remembered anchor as evicted. */
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 3000000, 100, false);
+	assert_true(replay_buffer_cache_find_keyframe(cache, 0, &ordinal));
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, ordinal, &info));
+	assert_true(info.dts_usec != 0);
+
+	/* A keyframe that is still buffered keeps answering with its own dts. */
+	assert_true(replay_buffer_cache_find_keyframe(cache, 1000000, &ordinal));
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, ordinal, &info));
+	assert_int_equal(info.dts_usec, 1000000);
+
+	/* An emptied cache has no anchor at all. */
+	replay_buffer_cache_clear(cache);
+	assert_false(replay_buffer_cache_find_keyframe(cache, 1000000, &ordinal));
+
+	replay_buffer_cache_destroy(cache);
+}
+
+/* Keyframe at or before time_usec, the same anchor rule the panel and the export
+ * use, expressed against the cache alone. */
+static bool anchor_at(replay_buffer_cache_t *cache, int64_t time_usec, int64_t *dts_usec)
+{
+	size_t ordinal = 0;
+	struct replay_buffer_keyframe_info info = {0};
+
+	if (replay_buffer_cache_find_keyframe(cache, time_usec, &ordinal) &&
+	    replay_buffer_cache_get_keyframe_info(cache, ordinal, &info) && info.dts_usec <= time_usec) {
+		*dts_usec = info.dts_usec;
+		return true;
+	}
+
+	if (replay_buffer_cache_find_prev_keyframe(cache, time_usec, &ordinal) &&
+	    replay_buffer_cache_get_keyframe_info(cache, ordinal, &info)) {
+		*dts_usec = info.dts_usec;
+		return true;
+	}
+
+	return false;
+}
+
+/* An export protects only the GOPs the writer has not reached; written history
+ * is retired by the normal limits as the watermark advances. */
+static void test_pin_protects_only_unwritten_gops(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, 2000000);
+
+	for (int64_t t = 0; t <= 9000000; t += 1000000)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, t, 100, false));
+
+	/* Settled head: 7s. The export covers 7s..9s. */
+	struct replay_buffer_keyframe_info oldest = {0};
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 7000000);
+
+	replay_buffer_cache_set_pin(cache, 7000000, 9000000);
+
+	for (int64_t t = 10000000; t <= 12000000; t += 1000000)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, t, 100, false));
+
+	/* The front GOP is still unwritten, so nothing can be retired even though
+	 * the buffer is well over the limit. */
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 7000000);
+
+	/* The timeline keeps the normal window: the pin is about memory, not about
+	 * freezing the scale at the export start. */
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.start_usec, 10000000);
+	assert_int_equal(info.end_usec, 12000000);
+
+	/* Writing through 8s releases the 7s GOP; the next one is still pending. */
+	replay_buffer_cache_set_pin_progress(cache, 8000000);
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 8000000);
+
+	/* The same watermark again must not change anything. */
+	replay_buffer_cache_set_pin_progress(cache, 8000000);
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 8000000);
+
+	/* Writing through the export end releases the 8s GOP; the GOP holding the
+	 * end stays until the export is actually finished. */
+	replay_buffer_cache_set_pin_progress(cache, 9000000);
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 9000000);
+
+	/* Clearing the pin (idempotently) trims once, all the way back. */
+	replay_buffer_cache_clear_pin(cache);
+	replay_buffer_cache_clear_pin(cache);
+
+	replay_buffer_cache_get_info(cache, &info);
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_true(oldest.dts_usec >= 10000000);
+	assert_int_equal(info.end_usec - info.start_usec, 2000000);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+/* GOPs before the export start are not part of it and stay evictable. */
+static void test_pin_ignores_gops_before_export_start(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, 2000000);
+
+	for (int64_t t = 0; t <= 9000000; t += 1000000)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, t, 100, false));
+
+	/* Export starts at 8s while the cache still holds the 7s GOP. */
+	replay_buffer_cache_set_pin(cache, 8000000, 9000000);
+
+	for (int64_t t = 10000000; t <= 12000000; t += 1000000)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, t, 100, false));
+
+	/* 7s is outside the export and was dropped; 8s is protected. */
+	struct replay_buffer_keyframe_info oldest = {0};
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 8000000);
+
+	replay_buffer_cache_clear_pin(cache);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+static void test_clear_resets_pin(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, 2000000);
+
+	for (int64_t t = 0; t <= 9000000; t += 1000000)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, t, 100, false));
+
+	replay_buffer_cache_set_pin(cache, 7000000, 9000000);
+	replay_buffer_cache_clear(cache);
+
+	/* If the protection had leaked, nothing below would ever be retired. */
+	for (int64_t t = 0; t <= 3000000; t += 1000000)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, t, 100, false));
+
+	struct replay_buffer_keyframe_info oldest = {0};
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &oldest));
+	assert_int_equal(oldest.dts_usec, 1000000);
+
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.keyframe_count, 3);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+/* Emulates the panel rule: while the clip's start keyframe rolls out, the start
+ * follows the oldest surviving keyframe until it meets the end keyframe, at
+ * which point the clip has collapsed and the panel goes live. */
+static void test_selection_start_follows_surviving_keyframes(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	const int64_t max_time_usec = 6000000;
+	const int64_t end_anchor = 10000000;
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, max_time_usec);
+
+	int64_t start_anchor = 2000000;
+	bool advanced = false;
+	bool collapsed = false;
+
+	for (int64_t t = 0; t <= 20 * 1000000LL; t += 100000) {
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, (t % 2000000) == 0, t, 100, false));
+
+		struct replay_buffer_cache_info info = {0};
+		replay_buffer_cache_get_info(cache, &info);
+		if (info.end_usec < max_time_usec)
+			continue;
+
+		/* The start keyframe is gone: realign to the oldest surviving one. */
+		int64_t resolved = 0;
+		if (!anchor_at(cache, start_anchor, &resolved) || resolved != start_anchor) {
+			assert_true(anchor_at(cache, info.start_usec, &resolved));
+			assert_true(resolved >= start_anchor);
+			start_anchor = resolved;
+			advanced = true;
+		}
+
+		if (start_anchor == end_anchor) {
+			collapsed = true;
+			break;
+		}
+
+		assert_true(start_anchor < end_anchor);
+	}
+
+	assert_true(advanced);
+	assert_true(collapsed);
+
+	replay_buffer_cache_destroy(cache);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -517,6 +910,14 @@ int main(void)
 		cmocka_unit_test(test_info_is_consistent),
 		cmocka_unit_test(test_push_reports_dropped_packets),
 		cmocka_unit_test(test_block_growth_and_eviction),
+		cmocka_unit_test(test_full_window_stays_stable_and_exports_full_length),
+		cmocka_unit_test(test_gop_interval_change_adapts),
+		cmocka_unit_test(test_small_max_time_degrades_to_gop_floor),
+		cmocka_unit_test(test_evicted_anchor_stops_resolving),
+		cmocka_unit_test(test_pin_protects_only_unwritten_gops),
+		cmocka_unit_test(test_pin_ignores_gops_before_export_start),
+		cmocka_unit_test(test_clear_resets_pin),
+		cmocka_unit_test(test_selection_start_follows_surviving_keyframes),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);
