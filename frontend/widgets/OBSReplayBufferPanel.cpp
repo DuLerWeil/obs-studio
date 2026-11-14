@@ -1013,11 +1013,15 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	setAutoFillBackground(false);
 	setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
 
-	/* A recreated display destroys its draw callbacks; drop the handle with it so
-	 * the old pointer is never used again. */
+	/* A recreated display destroys its draw callbacks; drop the handle and put
+	 * the reviewed frame back on the new one, so moving the window between
+	 * monitors does not require another seek to see it again. */
 	if (preview_) {
-		connect(preview_, &OBSQTDisplay::DisplayCreated, this,
-			[this](OBSQTDisplay *) { reviewDisplay_ = nullptr; });
+		connect(preview_, &OBSQTDisplay::DisplayCreated, this, [this](OBSQTDisplay *) {
+			reviewDisplay_ = nullptr;
+			/* Re-attaches only while a historical moment is being reviewed. */
+			UpdateReviewState();
+		});
 	}
 
 	/* The scale and its two markers carry the timing, so the only text left is
