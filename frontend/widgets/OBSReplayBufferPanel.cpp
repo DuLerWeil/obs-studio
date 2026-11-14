@@ -916,10 +916,6 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	exportTimer_.setInterval(200);
 	connect(&exportTimer_, &QTimer::timeout, this, &OBSReplayBufferPanel::PollExport);
 
-	selectionSettleTimer_.setSingleShot(true);
-	selectionSettleTimer_.setInterval(200);
-	connect(&selectionSettleTimer_, &QTimer::timeout, this, &OBSReplayBufferPanel::SnapSelection);
-
 	connect(timeline_, &OBSReplayBufferTimeline::PositionChanged, this, &OBSReplayBufferPanel::PositionChanged);
 	connect(timeline_, &OBSReplayBufferTimeline::SelectionChanged, this, &OBSReplayBufferPanel::SelectionChanged);
 	connect(timeline_, &OBSReplayBufferTimeline::GoLiveRequested, this, &OBSReplayBufferPanel::GoLive);
@@ -1280,16 +1276,11 @@ void OBSReplayBufferPanel::HidePanel()
 {
 	infoTimer_.stop();
 	fullFrameTimer_.stop();
-	selectionSettleTimer_.stop();
 	exportTimer_.stop();
 
 	CancelFullFrame();
 
 	timeline_->ClearSelection();
-	hasSelection_ = false;
-	selectionEndIsLive_ = false;
-	selectionStartUsec_ = 0;
-	selectionEndUsec_ = 0;
 	exportRunning_ = false;
 	followLive_ = true;
 	positionUsec_ = 0;
@@ -1430,20 +1421,10 @@ void OBSReplayBufferPanel::RefreshInfo()
 	timeline_->SetMaxDuration(maxTime);
 	timeline_->SetRange(rangeStartUsec_, rangeEndUsec_);
 	timeline_->SetPosition(positionUsec_);
-	/* A clip that was started without an end runs to the live edge, so it grows
-	 * with the buffer. */
-	if (hasSelection_ && selectionEndIsLive_) {
-		selectionEndUsec_ = rangeEndUsec_;
-		timeline_->SetSelection(selectionStartUsec_, selectionEndUsec_);
-	}
-
-	/* SetRange clamps or clears a selection that fell out of the rolling
-	 * window; keep the values used by the export action in sync. */
-	selectionStartUsec_ = timeline_->SelectionStart();
-	selectionEndUsec_ = timeline_->SelectionEnd();
-	hasSelection_ = timeline_->HasSelection();
-	if (!hasSelection_) {
-		selectionEndIsLive_ = false;
+	/* A clip that reaches the live edge keeps growing with the buffer; the
+	 * timeline owns the selection, so nothing is mirrored here. */
+	if (timeline_->HasSelection() && timeline_->SelectionEnd() >= rangeEndUsec_ - 1000000) {
+		timeline_->SetSelection(timeline_->SelectionStart(), rangeEndUsec_);
 	}
 
 	UpdateLabels();
@@ -1479,7 +1460,7 @@ void OBSReplayBufferPanel::UpdateControls()
 	nextButton_->setEnabled(usable);
 	saveButton_->setEnabled(usable);
 	UpdateGoLiveState();
-	exportAction_->setEnabled(usable && hasSelection_ && selectionEndUsec_ > selectionStartUsec_);
+	exportAction_->setEnabled(usable && timeline_->HasSelection());
 }
 
 void OBSReplayBufferPanel::UpdateGoLiveState()
@@ -1547,86 +1528,12 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 
 void OBSReplayBufferPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
 {
-	if (end_usec <= start_usec) {
-		hasSelection_ = false;
-		selectionEndIsLive_ = false;
-		selectionStartUsec_ = 0;
-		selectionEndUsec_ = 0;
-		exportAction_->setEnabled(false);
-		return;
-	}
+	Q_UNUSED(start_usec);
+	Q_UNUSED(end_usec);
 
-	blog(LOG_INFO, "[replay buffer] selection %.3fs - %.3fs (range %.3fs - %.3fs)", (double)start_usec / 1000000.0,
-	     (double)end_usec / 1000000.0, (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
-
-	hasSelection_ = true;
-	selectionStartUsec_ = start_usec;
-	selectionEndUsec_ = end_usec;
-	/* A clip that reaches the live edge keeps growing with it, which is what a
-	 * start-only selection means. */
-	selectionEndIsLive_ = end_usec >= rangeEndUsec_ - 1000;
-	exportAction_->setEnabled(false);
-	selectionSettleTimer_.start();
-}
-
-void OBSReplayBufferPanel::SnapSelection()
-{
-	if (!visible_ || !Active()) {
-		return;
-	}
-
-	/* Same source of truth as the export: the values the timeline is showing. A
-	 * clip that has been partially rolled out is clamped to what is left rather
-	 * than declared invalid. */
-	int64_t selectionStart = 0;
-	int64_t selectionEnd = 0;
-
-	if (timeline_->HasSelection()) {
-		selectionStart = qBound(rangeStartUsec_, timeline_->SelectionStart(), rangeEndUsec_);
-		selectionEnd = selectionEndIsLive_ ? rangeEndUsec_
-						   : qBound(rangeStartUsec_, timeline_->SelectionEnd(), rangeEndUsec_);
-	}
-
-	if (selectionEnd <= selectionStart) {
-		hasSelection_ = false;
-		exportAction_->setEnabled(false);
-		return;
-	}
-
-	hasSelection_ = true;
-	selectionStartUsec_ = selectionStart;
-	selectionEndUsec_ = selectionEnd;
-
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
-	if (!output) {
-		return;
-	}
-
-	proc_handler_t *ph = obs_output_get_proc_handler(output);
-	calldata_t cd = {0};
-	calldata_set_int(&cd, "start_usec", selectionStart);
-	calldata_set_int(&cd, "end_usec", selectionEnd);
-	proc_handler_call(ph, "snap_replay_selection", &cd);
-
-	const bool valid = calldata_bool(&cd, "valid");
-	const int64_t actualStart = calldata_int(&cd, "actual_start_usec");
-	const int64_t actualEnd = calldata_int(&cd, "actual_end_usec");
-	calldata_free(&cd);
-
-	blog(LOG_INFO, "[replay buffer] snap: valid %d, %.3fs - %.3fs", valid, (double)actualStart / 1000000.0,
-	     (double)actualEnd / 1000000.0);
-
-	if (!valid || actualEnd <= actualStart) {
-		exportAction_->setEnabled(false);
-		return;
-	}
-
-	selectionStartUsec_ = actualStart;
-	selectionEndUsec_ = actualEnd;
-	hasSelection_ = selectionEndUsec_ > selectionStartUsec_;
-	selectionEndIsLive_ = false;
-	timeline_->SetSelection(selectionStartUsec_, selectionEndUsec_);
-	exportAction_->setEnabled(!exportRunning_ && Active() && hasSelection_);
+	/* The timeline already holds the selection; only the button state depends on
+	 * it, and the export resolves the range against the cache. */
+	UpdateControls();
 }
 
 void OBSReplayBufferPanel::RequestFrame(bool snap)
@@ -1894,32 +1801,24 @@ void OBSReplayBufferPanel::ExportSelection()
 		return;
 	}
 
-	/* The timeline is the source of truth: it is what the user sees, and its
-	 * values are already clamped to the buffered window. Re-read it here instead
-	 * of trusting the cached copy, which could lag behind by a refresh and reject
-	 * a clip that is plainly visible. */
-	int64_t selectionStart = 0;
-	int64_t selectionEnd = 0;
-
-	if (timeline_->HasSelection()) {
-		selectionStart = qBound(rangeStartUsec_, timeline_->SelectionStart(), rangeEndUsec_);
-		selectionEnd = qBound(rangeStartUsec_, timeline_->SelectionEnd(), rangeEndUsec_);
-		if (selectionEndIsLive_) {
-			selectionEnd = rangeEndUsec_;
-		}
+	/* The timeline is the source of truth: it is what the user sees. Clamp it to
+	 * the window that is actually buffered and let the cache snap the start to a
+	 * keyframe; the values it settles on come back below. */
+	if (!timeline_->HasSelection()) {
+		ShowExportError(kExportErrInvalid);
+		return;
 	}
 
-	hasSelection_ = selectionEnd > selectionStart;
-	selectionStartUsec_ = selectionStart;
-	selectionEndUsec_ = selectionEnd;
+	const int64_t selectionStart = qBound(rangeStartUsec_, timeline_->SelectionStart(), rangeEndUsec_);
+	const bool live_end = timeline_->SelectionEnd() >= rangeEndUsec_ - 1000000;
+	const int64_t selectionEnd = live_end ? rangeEndUsec_
+					      : qBound(rangeStartUsec_, timeline_->SelectionEnd(), rangeEndUsec_);
 
-	blog(LOG_INFO,
-	     "[replay buffer] export: %.3fs - %.3fs (timeline %d, has selection %d, live end %d, range %.3fs - %.3fs)",
-	     (double)selectionStart / 1000000.0, (double)selectionEnd / 1000000.0, timeline_->HasSelection(),
-	     hasSelection_, selectionEndIsLive_, (double)rangeStartUsec_ / 1000000.0,
-	     (double)rangeEndUsec_ / 1000000.0);
+	blog(LOG_INFO, "[replay buffer] export: %.3fs - %.3fs (live end %d, range %.3fs - %.3fs)",
+	     (double)selectionStart / 1000000.0, (double)selectionEnd / 1000000.0, live_end,
+	     (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
 
-	if (!hasSelection_) {
+	if (selectionEnd <= selectionStart) {
 		ShowExportError(kExportErrInvalid);
 		return;
 	}
@@ -1949,11 +1848,8 @@ void OBSReplayBufferPanel::ExportSelection()
 		return;
 	}
 
-	selectionStartUsec_ = actualStart;
-	selectionEndUsec_ = actualEnd;
-	hasSelection_ = selectionEndUsec_ > selectionStartUsec_;
-	selectionEndIsLive_ = false;
-	timeline_->SetSelection(selectionStartUsec_, selectionEndUsec_);
+	/* Show the range the cache actually snapped to. */
+	timeline_->SetSelection(actualStart, actualEnd);
 
 	exportRunning_ = true;
 	exportTimer_.start();

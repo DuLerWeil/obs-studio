@@ -21,7 +21,6 @@ struct replay_buffer_keyframe_info {
 	 * replay_buffer_cache_ref_packet_at(). */
 	uint64_t index;
 	int64_t dts_usec;
-	int64_t duration_usec;
 };
 
 typedef struct replay_buffer_cache replay_buffer_cache_t;
@@ -82,9 +81,6 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 /* Refs the packet at that absolute index. Returns false when the index has been
  * evicted or does not match the slot it maps to. */
 bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t index, struct encoder_packet *packet);
-/* Absolute index of the packet whose dts is closest to time_usec. Used to decode
- * up to the exact frame under the playhead instead of the keyframe before it. */
-bool replay_buffer_cache_find_packet(replay_buffer_cache_t *cache, int64_t time_usec, uint64_t *index);
 
 /* Whole-buffer snapshot used by the save path. */
 replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cache_t *cache);

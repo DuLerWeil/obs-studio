@@ -366,13 +366,6 @@ bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t 
 		const struct replay_buffer_gop *gop = cache_gop_at(cache, index);
 		info->index = gop->first_index;
 		info->dts_usec = gop->start_dts_usec;
-
-		if (index + 1 < count) {
-			info->duration_usec = cache_gop_at(cache, index + 1)->start_dts_usec - gop->start_dts_usec;
-		} else if (cache->last_dts_usec > gop->start_dts_usec) {
-			info->duration_usec = cache->last_dts_usec - gop->start_dts_usec;
-		}
-
 		found = true;
 	}
 
@@ -650,51 +643,6 @@ bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t in
 	struct replay_buffer_packet *slot = cache_live_slot(cache, index);
 	if (slot) {
 		obs_encoder_packet_ref(packet, &slot->packet);
-		found = true;
-	}
-
-	pthread_mutex_unlock(&cache->mutex);
-	return found;
-}
-
-bool replay_buffer_cache_find_packet(replay_buffer_cache_t *cache, int64_t time_usec, uint64_t *index)
-{
-	if (!cache || !index)
-		return false;
-
-	bool found = false;
-	pthread_mutex_lock(&cache->mutex);
-
-	if (cache_packet_count(cache) > 0) {
-		uint64_t low = cache->first_index;
-		uint64_t high = cache->next_index - 1;
-
-		while (low < high) {
-			const uint64_t middle = low + (high - low) / 2;
-			struct replay_buffer_packet *slot = cache_live_slot(cache, middle);
-			if (!slot) {
-				low = middle + 1;
-				continue;
-			}
-			if (slot->packet.dts_usec < time_usec)
-				low = middle + 1;
-			else
-				high = middle;
-		}
-
-		struct replay_buffer_packet *slot = cache_live_slot(cache, low);
-		if (!slot) {
-			pthread_mutex_unlock(&cache->mutex);
-			return false;
-		}
-
-		if (low > cache->first_index && slot->packet.dts_usec > time_usec) {
-			struct replay_buffer_packet *prev = cache_live_slot(cache, low - 1);
-			if (prev && time_usec - prev->packet.dts_usec < slot->packet.dts_usec - time_usec)
-				low--;
-		}
-
-		*index = low;
 		found = true;
 	}
 

@@ -1021,20 +1021,6 @@ static void get_replay_buffer_info(void *data, calldata_t *cd)
 	calldata_set_int(cd, "max_time_usec", stream->max_time);
 }
 
-static void get_replay_keyframe_info(void *data, calldata_t *cd)
-{
-	struct ffmpeg_muxer *stream = data;
-	const long long index = calldata_int(cd, "index");
-	struct replay_buffer_keyframe_info frame_info = {0};
-
-	if (index >= 0)
-		replay_buffer_cache_get_keyframe_info(stream->replay_cache, (size_t)index, &frame_info);
-
-	calldata_set_int(cd, "packet_index", (long long)frame_info.index);
-	calldata_set_int(cd, "dts_usec", frame_info.dts_usec);
-	calldata_set_int(cd, "duration_usec", frame_info.duration_usec);
-}
-
 static void find_replay_keyframe(void *data, calldata_t *cd)
 {
 	struct ffmpeg_muxer *stream = data;
@@ -1132,28 +1118,6 @@ static void replay_buffer_prepare_packets(struct ffmpeg_muxer *stream, replay_bu
 static void replay_buffer_make_temp_path(const char *final_path, struct dstr *temp_path);
 static void replay_buffer_free_mux_packets(struct ffmpeg_muxer *stream);
 static void *replay_buffer_mux_thread(void *data);
-
-static void snap_replay_selection(void *data, calldata_t *cd)
-{
-	struct ffmpeg_muxer *stream = data;
-	int64_t actual_start = 0;
-	int64_t actual_end = 0;
-
-	const bool valid = replay_buffer_cache_resolve_range(stream->replay_cache, calldata_int(cd, "start_usec"),
-							     calldata_int(cd, "end_usec"), &actual_start, &actual_end);
-
-	calldata_set_bool(cd, "valid", valid);
-	calldata_set_int(cd, "actual_start_usec", actual_start);
-	calldata_set_int(cd, "actual_end_usec", actual_end);
-}
-
-static void get_replay_export_status(void *data, calldata_t *cd)
-{
-	struct ffmpeg_muxer *stream = data;
-
-	calldata_set_int(cd, "state", os_atomic_load_long(&stream->export_state));
-	calldata_set_int(cd, "error", os_atomic_load_long(&stream->export_error));
-}
 
 static void export_replay_selection(void *data, calldata_t *cd)
 {
@@ -1269,10 +1233,7 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 			 "void get_replay_buffer_info(out int start_time_usec, out int end_time_usec, "
 			 "out int keyframe_count, out int max_time_usec)",
 			 get_replay_buffer_info, stream);
-	proc_handler_add(ph,
-			 "void get_replay_keyframe_info(int index, out int packet_index, out int dts_usec, "
-			 "out int duration_usec)",
-			 get_replay_keyframe_info, stream);
+
 	proc_handler_add(ph, "void find_replay_keyframe(int time_usec, out int index, out int dts_usec)",
 			 find_replay_keyframe, stream);
 	proc_handler_add(ph, "void find_prev_replay_keyframe(int time_usec, out int index, out int dts_usec)",
@@ -1285,10 +1246,7 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 			 "void copy_replay_full_frame(int request_id, int capacity, in ptr dst, "
 			 "out int status, out int width, out int height, out int size)",
 			 copy_replay_full_frame, stream);
-	proc_handler_add(ph,
-			 "void snap_replay_selection(int start_usec, int end_usec, out int valid, "
-			 "out int actual_start_usec, out int actual_end_usec)",
-			 snap_replay_selection, stream);
+
 	proc_handler_add(ph,
 			 "void export_replay_selection(int start_usec, int end_usec, out int result, "
 			 "out int actual_start_usec, out int actual_end_usec)",
