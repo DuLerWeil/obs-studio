@@ -19,6 +19,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#if defined(__has_include) && __has_include(<pthread/qos.h>)
+#include <pthread/qos.h>
+#endif
 #else
 #include <sys/resource.h>
 #endif
@@ -122,9 +126,15 @@ static void decoder_thread_set_low_priority(void)
 {
 #ifdef _WIN32
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-#else
-	/* On Linux nice values are per-thread; on other POSIX systems this is
-	 * still a harmless best-effort hint. */
+#elif defined(__APPLE__)
+	/* Nice values are per-process on macOS, so lowering them would drag the
+	 * whole application down; use the thread QoS class instead. SDKs without
+	 * the QoS API simply keep the default priority. */
+#if defined(__has_include) && __has_include(<pthread/qos.h>)
+	pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+#elif defined(__linux__)
+	/* Linux applies nice values per thread. */
 	setpriority(PRIO_PROCESS, 0, 10);
 #endif
 }
@@ -514,7 +524,8 @@ static void *frame_thread(void *param)
 {
 	replay_buffer_frame_decoder_t *frame_decoder = param;
 
-	os_set_thread_name("replay-buffer: frame");
+	/* Kept within 15 bytes: Linux truncates thread names past that. */
+	os_set_thread_name("replaybuf:frame");
 	decoder_thread_set_low_priority();
 
 	for (;;) {

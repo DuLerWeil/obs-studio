@@ -660,7 +660,11 @@ static void generate_filename(struct ffmpeg_muxer *stream, struct dstr *dst, boo
 	char *filename = os_generate_formatted_filename(ext, space, fmt);
 
 	dstr_copy(dst, dir);
+#ifdef _WIN32
+	/* Windows accepts both separators, but the suffix helpers below look for
+	 * '/'. POSIX keeps the path untouched: a backslash is a valid filename. */
 	dstr_replace(dst, "\\", "/");
+#endif
 	if (dstr_end(dst) != '/') {
 		dstr_cat_ch(dst, '/');
 	}
