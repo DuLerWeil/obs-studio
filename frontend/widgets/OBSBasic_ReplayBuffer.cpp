@@ -21,7 +21,7 @@
 
 #include <components/UIValidation.hpp>
 
-#include <obs-replay-buffer-interface.h>
+#include <obs-replay-interface.h>
 #include <qt-wrappers.hpp>
 
 #include <QCheckBox>
@@ -38,7 +38,7 @@ void OBSBasic::ReplayBufferActionTriggered()
 	}
 };
 
-obs_output_t *OBSBasic::GetReplayBufferOutput()
+obs_output_t *OBSBasic::GetReplayOutput()
 {
 	if (!outputHandler || !outputHandler->replayBuffer) {
 		return nullptr;
@@ -174,7 +174,7 @@ void OBSBasic::ReplayBufferSave()
 
 	calldata_t cd = {0};
 	proc_handler_t *ph = obs_output_get_proc_handler(outputHandler->replayBuffer);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_SAVE, &cd);
+	proc_handler_call(ph, REPLAY_PROC_SAVE, &cd);
 	calldata_free(&cd);
 }
 
@@ -189,7 +189,7 @@ void OBSBasic::ReplayBufferSaved()
 
 	calldata_t cd = {0};
 	proc_handler_t *ph = obs_output_get_proc_handler(outputHandler->replayBuffer);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_LAST_REPLAY, &cd);
+	proc_handler_call(ph, REPLAY_PROC_GET_LAST_REPLAY, &cd);
 	std::string path = calldata_string(&cd, "path");
 	QString msg = QTStr("Basic.StatusBar.ReplayBufferSavedTo").arg(QT_UTF8(path.c_str()));
 	ShowStatusBarMessage(msg);

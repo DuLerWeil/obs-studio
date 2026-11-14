@@ -103,7 +103,7 @@ static enum AVCodecID codec_id_from_name(const char *codec)
 	return AV_CODEC_ID_NONE;
 }
 
-/* Everything OBS can hand the replay buffer decodes through libavcodec, so the
+/* Everything OBS can hand the replay decodes through libavcodec, so the
  * known names are mapped explicitly and anything else is looked up by name. */
 static const AVCodec *find_decoder_for_codec(const char *codec_name)
 {
@@ -142,7 +142,7 @@ static void decoder_thread_set_low_priority(void)
 static void decoder_report_failure(struct replay_buffer_decoder *decoder, int code)
 {
 	if (decoder->failures < 3) {
-		blog(LOG_INFO, "[replay buffer] keyframe decode failed (%d)", code);
+		blog(LOG_INFO, "[replay] keyframe decode failed (%d)", code);
 	}
 
 	decoder->failures++;
@@ -212,8 +212,7 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 	const char *codec_name = obs_encoder_get_codec(frame_decoder->encoder);
 	const AVCodec *codec = find_decoder_for_codec(codec_name);
 	if (!codec) {
-		blog(LOG_WARNING, "[replay buffer] no keyframe decoder for codec '%s'",
-		     codec_name ? codec_name : "(null)");
+		blog(LOG_WARNING, "[replay] no keyframe decoder for codec '%s'", codec_name ? codec_name : "(null)");
 		decoder->failed = true;
 		return false;
 	}
@@ -270,14 +269,14 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 
 	const int ret = avcodec_open2(context, codec, NULL);
 	if (ret < 0) {
-		blog(LOG_WARNING, "[replay buffer] failed to open '%s' decoder (%d)", codec_name, ret);
+		blog(LOG_WARNING, "[replay] failed to open '%s' decoder (%d)", codec_name, ret);
 		avcodec_free_context(&context);
 		decoder->failed = true;
 		return false;
 	}
 
 	decoder->decoder = context;
-	blog(LOG_INFO, "[replay buffer] decoder opened: codec '%s', extradata %d bytes, %dx%d",
+	blog(LOG_INFO, "[replay] decoder opened: codec '%s', extradata %d bytes, %dx%d",
 	     codec_name ? codec_name : "(null)", context->extradata_size, context->width, context->height);
 	return true;
 }
@@ -591,7 +590,7 @@ bool replay_buffer_frame_decoder_copy(replay_buffer_frame_decoder_t *frame_decod
 		return false;
 	}
 
-	*status = REPLAY_BUFFER_FRAME_PENDING;
+	*status = REPLAY_FRAME_PENDING;
 	*width = 0;
 	*height = 0;
 	*size = 0;
@@ -600,9 +599,9 @@ bool replay_buffer_frame_decoder_copy(replay_buffer_frame_decoder_t *frame_decod
 
 	if (frame_decoder->has_result && frame_decoder->result_id == request_id) {
 		if (frame_decoder->result_failed) {
-			*status = REPLAY_BUFFER_FRAME_FAILED;
+			*status = REPLAY_FRAME_FAILED;
 		} else {
-			*status = REPLAY_BUFFER_FRAME_READY;
+			*status = REPLAY_FRAME_READY;
 			*width = frame_decoder->width;
 			*height = frame_decoder->height;
 			*size = frame_decoder->size;
@@ -611,7 +610,7 @@ bool replay_buffer_frame_decoder_copy(replay_buffer_frame_decoder_t *frame_decod
 				if (capacity >= frame_decoder->size) {
 					memcpy(dst, frame_decoder->rgba, frame_decoder->size);
 				} else {
-					*status = REPLAY_BUFFER_FRAME_FAILED;
+					*status = REPLAY_FRAME_FAILED;
 				}
 			}
 		}
@@ -640,7 +639,7 @@ replay_buffer_frame_decoder_t *replay_buffer_frame_decoder_create(obs_encoder_t 
 
 	const char *codec_name = obs_encoder_get_codec(video_encoder);
 	if (!find_decoder_for_codec(codec_name)) {
-		blog(LOG_WARNING, "[replay buffer] decoder for codec '%s' is not available",
+		blog(LOG_WARNING, "[replay] decoder for codec '%s' is not available",
 		     codec_name ? codec_name : "(null)");
 		return NULL;
 	}

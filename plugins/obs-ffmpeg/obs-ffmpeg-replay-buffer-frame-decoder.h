@@ -2,7 +2,7 @@
 
 #include "obs-ffmpeg-replay-buffer.h"
 
-#include <obs-replay-buffer-interface.h>
+#include <obs-replay-interface.h>
 
 typedef struct replay_buffer_frame_decoder replay_buffer_frame_decoder_t;
 
@@ -25,7 +25,7 @@ bool replay_buffer_frame_decoder_request(replay_buffer_frame_decoder_t *frame_de
 					 uint64_t request_id);
 
 /* Queries or copies the result of request_id. status is one of
- * REPLAY_BUFFER_FRAME_PENDING/READY/FAILED. With dst == NULL and capacity == 0
+ * REPLAY_FRAME_PENDING/READY/FAILED. With dst == NULL and capacity == 0
  * only the dimensions and size are reported. A ready result is kept until the
  * next result is published or the decoder is destroyed. */
 bool replay_buffer_frame_decoder_copy(replay_buffer_frame_decoder_t *frame_decoder, uint64_t request_id, uint8_t *dst,

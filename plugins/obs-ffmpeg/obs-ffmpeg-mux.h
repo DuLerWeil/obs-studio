@@ -27,18 +27,18 @@ struct ffmpeg_muxer {
 	struct dstr muxer_settings;
 	struct dstr stream_key;
 
-	/* replay buffer and split file */
+	/* replay and split file */
 	int64_t cur_size;
 	int64_t cur_time;
 	int64_t max_size;
 	int64_t max_time;
 
-	/* replay buffer */
+	/* replay */
 	int64_t save_ts;
 	replay_buffer_cache_t *replay_cache;
 	replay_buffer_frame_decoder_t *frame_decoder;
-	pthread_mutex_t replay_buffer_mutex;
-	bool replay_buffer_mutex_initialized;
+	pthread_mutex_t replay_mutex;
+	bool replay_mutex_initialized;
 	/* The GPU encode thread may still hand us a packet while the output is being
 	 * destroyed; destroy sets replay_shutdown and waits for replay_callbacks to
 	 * reach zero before it frees anything the callback touches. */
@@ -67,7 +67,7 @@ struct ffmpeg_muxer {
 	bool split_file_ready;
 	volatile bool manual_split;
 
-	/* these are accessed both by replay buffer and by HLS */
+	/* these are accessed both by replay and by HLS */
 	pthread_t mux_thread;
 	bool mux_thread_joinable;
 	struct deque packets;

@@ -12,8 +12,8 @@ include(cmake/dependencies.cmake)
 add_library(obs-ffmpeg MODULE)
 add_library(OBS::ffmpeg ALIAS obs-ffmpeg)
 
-if(NOT TARGET OBS::replay-buffer-interface)
-  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/replay-buffer-interface" replay-buffer-interface)
+if(NOT TARGET OBS::replay-interface)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/replay-interface" replay-interface)
 endif()
 
 add_subdirectory(ffmpeg-mux)
@@ -64,7 +64,7 @@ target_link_libraries(
     OBS::libobs
     OBS::media-playback
     OBS::opts-parser
-    OBS::replay-buffer-interface
+    OBS::replay-interface
     FFmpeg::avcodec
     FFmpeg::avfilter
     FFmpeg::avformat

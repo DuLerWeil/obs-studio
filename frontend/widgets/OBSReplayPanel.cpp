@@ -1,9 +1,9 @@
-#include "OBSReplayBufferPanel.hpp"
+#include "OBSReplayPanel.hpp"
 
 #include "OBSBasic.hpp"
 
 #include <obs-frontend-api.h>
-#include <obs-replay-buffer-interface.h>
+#include <obs-replay-interface.h>
 #include <obs.hpp>
 #include <qt-wrappers.hpp>
 
@@ -32,7 +32,7 @@
 #include <algorithm>
 #include <utility>
 
-#include "moc_OBSReplayBufferPanel.cpp"
+#include "moc_OBSReplayPanel.cpp"
 
 namespace {
 
@@ -142,7 +142,7 @@ int64_t KeyframeAnchorAt(proc_handler_t *ph, int64_t time_usec)
 {
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", time_usec);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &cd);
+	proc_handler_call(ph, REPLAY_PROC_FIND_KEYFRAME, &cd);
 	int ordinal = (int)calldata_int(&cd, "ordinal");
 	int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
@@ -155,7 +155,7 @@ int64_t KeyframeAnchorAt(proc_handler_t *ph, int64_t time_usec)
 
 	calldata_t prev = {0};
 	calldata_set_int(&prev, "time_usec", time_usec);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_PREV_KEYFRAME, &prev);
+	proc_handler_call(ph, REPLAY_PROC_FIND_PREV_KEYFRAME, &prev);
 	ordinal = (int)calldata_int(&prev, "ordinal");
 	dts = calldata_int(&prev, "dts_usec");
 	calldata_free(&prev);
@@ -172,7 +172,7 @@ bool KeyframeAnchorEvicted(proc_handler_t *ph, int64_t anchor_usec)
 {
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", anchor_usec);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &cd);
+	proc_handler_call(ph, REPLAY_PROC_FIND_KEYFRAME, &cd);
 	const int ordinal = (int)calldata_int(&cd, "ordinal");
 	const int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
@@ -186,7 +186,7 @@ bool KeyframeAnchorEvicted(proc_handler_t *ph, int64_t anchor_usec)
 /* Timeline                                                                  */
 /* ------------------------------------------------------------------------- */
 
-OBSReplayBufferTimeline::OBSReplayBufferTimeline(QWidget *parent) : QWidget(parent)
+OBSReplayTimeline::OBSReplayTimeline(QWidget *parent) : QWidget(parent)
 {
 	setMouseTracking(true);
 	setCursor(Qt::PointingHandCursor);
@@ -194,7 +194,7 @@ OBSReplayBufferTimeline::OBSReplayBufferTimeline(QWidget *parent) : QWidget(pare
 	setMinimumHeight(PreferredHeight());
 }
 
-void OBSReplayBufferTimeline::changeEvent(QEvent *event)
+void OBSReplayTimeline::changeEvent(QEvent *event)
 {
 	QWidget::changeEvent(event);
 
@@ -206,40 +206,40 @@ void OBSReplayBufferTimeline::changeEvent(QEvent *event)
 	}
 }
 
-QSize OBSReplayBufferTimeline::sizeHint() const
+QSize OBSReplayTimeline::sizeHint() const
 {
 	return QSize(400, PreferredHeight());
 }
 
-QFontMetrics OBSReplayBufferTimeline::ScaleMetrics() const
+QFontMetrics OBSReplayTimeline::ScaleMetrics() const
 {
 	return QFontMetrics(ScaleFont(font()));
 }
 
-int OBSReplayBufferTimeline::AxisY() const
+int OBSReplayTimeline::AxisY() const
 {
 	/* One label row above the ticks, which is where the ruler baseline lives. */
 	return kEdgeMargin + ScaleMetrics().height() + kLabelGap + kTickHeight / 2;
 }
 
-int OBSReplayBufferTimeline::PreferredHeight() const
+int OBSReplayTimeline::PreferredHeight() const
 {
 	/* Marker triangles, then their time readout, then the bottom margin. */
 	const int markBottom = AxisY() + kGrooveHeight / 2 + kMarkerHeight;
 	return markBottom + kLabelGap + ScaleMetrics().height() + kEdgeMargin;
 }
 
-int OBSReplayBufferTimeline::TrackLeft() const
+int OBSReplayTimeline::TrackLeft() const
 {
 	return kTrackInset;
 }
 
-int OBSReplayBufferTimeline::TrackWidth() const
+int OBSReplayTimeline::TrackWidth() const
 {
 	return qMax(1, width() - kTrackInset * 2);
 }
 
-void OBSReplayBufferTimeline::DrawRuler(QPainter &painter, int left, int width, int axisY) const
+void OBSReplayTimeline::DrawRuler(QPainter &painter, int left, int width, int axisY) const
 {
 	/* The step is derived from the fixed axis, so the ticks keep their
 	 * positions while the buffer is still filling up. */
@@ -314,7 +314,7 @@ void OBSReplayBufferTimeline::DrawRuler(QPainter &painter, int left, int width, 
 	painter.restore();
 }
 
-int64_t OBSReplayBufferTimeline::FullAxisSpan() const
+int64_t OBSReplayTimeline::FullAxisSpan() const
 {
 	const int64_t buffered = rangeEnd_ - rangeStart_;
 	if (maxDuration_ > 0 && maxDuration_ > buffered) {
@@ -323,19 +323,19 @@ int64_t OBSReplayBufferTimeline::FullAxisSpan() const
 	return buffered;
 }
 
-int64_t OBSReplayBufferTimeline::AxisLead() const
+int64_t OBSReplayTimeline::AxisLead() const
 {
 	/* Reserve a sixth of the configured window past "now", so the axis never
 	 * ends right under the newest frame: a 30 minute limit spans -35 to +5. */
 	return FullAxisSpan() / 6;
 }
 
-int64_t OBSReplayBufferTimeline::LiveAxisEnd() const
+int64_t OBSReplayTimeline::LiveAxisEnd() const
 {
 	return rangeEnd_ + AxisLead();
 }
 
-int64_t OBSReplayBufferTimeline::AxisSpan() const
+int64_t OBSReplayTimeline::AxisSpan() const
 {
 	if (frozen_) {
 		return frozenSpan_;
@@ -348,7 +348,7 @@ int64_t OBSReplayBufferTimeline::AxisSpan() const
 	return full;
 }
 
-int64_t OBSReplayBufferTimeline::AxisEnd() const
+int64_t OBSReplayTimeline::AxisEnd() const
 {
 	if (frozen_) {
 		return frozenEnd_;
@@ -357,12 +357,12 @@ int64_t OBSReplayBufferTimeline::AxisEnd() const
 	return zoomSpan_ > 0 ? axisEnd_ : LiveAxisEnd();
 }
 
-int64_t OBSReplayBufferTimeline::AxisStart() const
+int64_t OBSReplayTimeline::AxisStart() const
 {
 	return AxisEnd() - AxisSpan();
 }
 
-int OBSReplayBufferTimeline::AxisLeft() const
+int OBSReplayTimeline::AxisLeft() const
 {
 	/* The widget shares its row with the step buttons, so the scale fills the
 	 * whole track instead of keeping a margin on each side. The frozen axis has
@@ -371,12 +371,12 @@ int OBSReplayBufferTimeline::AxisLeft() const
 	return TrackLeft();
 }
 
-int OBSReplayBufferTimeline::AxisWidth() const
+int OBSReplayTimeline::AxisWidth() const
 {
 	return TrackWidth();
 }
 
-double OBSReplayBufferTimeline::RatioForTime(int64_t time_usec) const
+double OBSReplayTimeline::RatioForTime(int64_t time_usec) const
 {
 	const int64_t span = AxisSpan();
 	if (span <= 0) {
@@ -386,13 +386,13 @@ double OBSReplayBufferTimeline::RatioForTime(int64_t time_usec) const
 	return (double)(time_usec - AxisStart()) / (double)span;
 }
 
-int OBSReplayBufferTimeline::XForTime(int64_t time_usec) const
+int OBSReplayTimeline::XForTime(int64_t time_usec) const
 {
 	const double ratio = qBound(0.0, RatioForTime(time_usec), 1.0);
 	return AxisLeft() + (int)(ratio * (double)AxisWidth());
 }
 
-int64_t OBSReplayBufferTimeline::RawTimeAt(int x) const
+int64_t OBSReplayTimeline::RawTimeAt(int x) const
 {
 	const int64_t span = AxisSpan();
 	if (span <= 0) {
@@ -406,14 +406,14 @@ int64_t OBSReplayBufferTimeline::RawTimeAt(int x) const
 	return AxisStart() + (int64_t)(ratio * (double)span);
 }
 
-int64_t OBSReplayBufferTimeline::TimeAt(int x) const
+int64_t OBSReplayTimeline::TimeAt(int x) const
 {
 	/* The left part of a fixed axis may still be unbuffered and the right part
 	 * is reserved past "now"; a click there must land on a frame that exists. */
 	return qBound(rangeStart_, RawTimeAt(x), rangeEnd_);
 }
 
-bool OBSReplayBufferTimeline::PlayheadHit(const QPoint &pos) const
+bool OBSReplayTimeline::PlayheadHit(const QPoint &pos) const
 {
 	if (rangeEnd_ <= rangeStart_) {
 		return false;
@@ -429,7 +429,7 @@ bool OBSReplayBufferTimeline::PlayheadHit(const QPoint &pos) const
 	       pos.y() <= markBottom + kMarkerHitPadding;
 }
 
-void OBSReplayBufferTimeline::SetFrozen(bool frozen)
+void OBSReplayTimeline::SetFrozen(bool frozen)
 {
 	if (frozen_ == frozen) {
 		return;
@@ -453,7 +453,7 @@ void OBSReplayBufferTimeline::SetFrozen(bool frozen)
 	update();
 }
 
-void OBSReplayBufferTimeline::SetRange(int64_t start_usec, int64_t end_usec)
+void OBSReplayTimeline::SetRange(int64_t start_usec, int64_t end_usec)
 {
 	if (end_usec < start_usec) {
 		end_usec = start_usec;
@@ -512,7 +512,7 @@ void OBSReplayBufferTimeline::SetRange(int64_t start_usec, int64_t end_usec)
 	update();
 }
 
-void OBSReplayBufferTimeline::SetMaxDuration(int64_t max_usec)
+void OBSReplayTimeline::SetMaxDuration(int64_t max_usec)
 {
 	if (maxDuration_ == max_usec) {
 		return;
@@ -522,13 +522,13 @@ void OBSReplayBufferTimeline::SetMaxDuration(int64_t max_usec)
 	update();
 }
 
-void OBSReplayBufferTimeline::SetPosition(int64_t position_usec)
+void OBSReplayTimeline::SetPosition(int64_t position_usec)
 {
 	position_ = qBound(rangeStart_, position_usec, rangeEnd_);
 	update();
 }
 
-void OBSReplayBufferTimeline::SetSelection(int64_t start_usec, int64_t end_usec)
+void OBSReplayTimeline::SetSelection(int64_t start_usec, int64_t end_usec)
 {
 	/* An explicit range, so it stops tracking the live edge. */
 	selectionFollowsLive_ = false;
@@ -544,7 +544,7 @@ void OBSReplayBufferTimeline::SetSelection(int64_t start_usec, int64_t end_usec)
 	update();
 }
 
-void OBSReplayBufferTimeline::ClearSelection()
+void OBSReplayTimeline::ClearSelection()
 {
 	selectionFollowsLive_ = false;
 	selectionStart_ = 0;
@@ -552,7 +552,7 @@ void OBSReplayBufferTimeline::ClearSelection()
 	update();
 }
 
-void OBSReplayBufferTimeline::MoveSelectionEndpoint(int64_t time_usec)
+void OBSReplayTimeline::MoveSelectionEndpoint(int64_t time_usec)
 {
 	const int64_t time = qBound(rangeStart_, time_usec, rangeEnd_);
 
@@ -597,7 +597,7 @@ void OBSReplayBufferTimeline::MoveSelectionEndpoint(int64_t time_usec)
 	emit SelectionChanged(selectionStart_, selectionEnd_);
 }
 
-void OBSReplayBufferTimeline::paintEvent(QPaintEvent *event)
+void OBSReplayTimeline::paintEvent(QPaintEvent *event)
 {
 	UNUSED_PARAMETER(event);
 
@@ -703,7 +703,7 @@ void OBSReplayBufferTimeline::paintEvent(QPaintEvent *event)
 	painter.drawText(positionLabel.left(), labelBaseline, positionText);
 }
 
-void OBSReplayBufferTimeline::mousePressEvent(QMouseEvent *event)
+void OBSReplayTimeline::mousePressEvent(QMouseEvent *event)
 {
 	/* Swallow the right press so the double click that follows is delivered to
 	 * this widget instead of bubbling up to the parent. */
@@ -767,7 +767,7 @@ void OBSReplayBufferTimeline::mousePressEvent(QMouseEvent *event)
 	}
 }
 
-void OBSReplayBufferTimeline::mouseMoveEvent(QMouseEvent *event)
+void OBSReplayTimeline::mouseMoveEvent(QMouseEvent *event)
 {
 	/* The release is lost when the buffer stops mid-drag and the panel is
 	 * hidden, so trust the button state rather than the last press. Otherwise
@@ -803,7 +803,7 @@ void OBSReplayBufferTimeline::mouseMoveEvent(QMouseEvent *event)
 	QWidget::mouseMoveEvent(event);
 }
 
-void OBSReplayBufferTimeline::mouseReleaseEvent(QMouseEvent *event)
+void OBSReplayTimeline::mouseReleaseEvent(QMouseEvent *event)
 {
 	if (event->button() != Qt::LeftButton) {
 		QWidget::mouseReleaseEvent(event);
@@ -825,7 +825,7 @@ void OBSReplayBufferTimeline::mouseReleaseEvent(QMouseEvent *event)
 	}
 }
 
-void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
+void OBSReplayTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 {
 	if (rangeEnd_ <= rangeStart_) {
 		/* Nothing is buffered yet (or the panel is showing its empty scale).
@@ -911,7 +911,7 @@ void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 	event->accept();
 }
 
-void OBSReplayBufferTimeline::wheelEvent(QWheelEvent *event)
+void OBSReplayTimeline::wheelEvent(QWheelEvent *event)
 {
 	const int delta = event->angleDelta().y();
 	if (delta == 0 || rangeEnd_ <= rangeStart_) {
@@ -973,7 +973,7 @@ void OBSReplayBufferTimeline::wheelEvent(QWheelEvent *event)
 	event->accept();
 }
 
-void OBSReplayBufferTimeline::ResetZoom()
+void OBSReplayTimeline::ResetZoom()
 {
 	const bool changed = zoomSpan_ != 0;
 	zoomSpan_ = 0;
@@ -988,7 +988,7 @@ void OBSReplayBufferTimeline::ResetZoom()
 	}
 }
 
-void OBSReplayBufferTimeline::leaveEvent(QEvent *event)
+void OBSReplayTimeline::leaveEvent(QEvent *event)
 {
 	hovering_ = false;
 	update();
@@ -999,12 +999,12 @@ void OBSReplayBufferTimeline::leaveEvent(QEvent *event)
 /* Docked panel                                                              */
 /* ------------------------------------------------------------------------- */
 
-OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview)
+OBSReplayPanel::OBSReplayPanel(OBSBasic *main, OBSQTDisplay *preview)
 	: QWidget(nullptr),
 	  main_(main),
 	  preview_(preview)
 {
-	setObjectName(QStringLiteral("replayBufferPanel"));
+	setObjectName(QStringLiteral("replayPanel"));
 	/* The panel lives in the preview column's layout, below the zoom controls
 	 * and the scroll bars, so it never covers the program output and needs no
 	 * native window of its own. It may be squeezed when the column is short,
@@ -1057,13 +1057,13 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	/* Two explicit buttons replace the old options menu: exporting the whole
 	 * buffer and exporting the marked clip. Their icons share the save arrow and
 	 * tray; a full bar marks the whole buffer, framing corners mark a selection. */
-	saveButton_ = makeButton(ThemeIcon("replay-save-all.svg"), QTStr("Basic.Main.SaveReplay"), navIconSize);
-	connect(saveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::SaveReplay);
+	saveButton_ = makeButton(ThemeIcon("replay-save-all.svg"), navIconSize);
+	connect(saveButton_, &QToolButton::clicked, this, &OBSReplayPanel::SaveReplay);
 
-	exportAction_ = new QAction(QTStr("Basic.Main.Preview.ReplayBuffer.ExportSelection"), this);
+	exportAction_ = new QAction(QTStr("Basic.Main.Preview.Replay.ExportSelection"), this);
 	exportAction_->setEnabled(false);
 	exportAction_->setIcon(ThemeIcon("replay-save-selection.svg"));
-	connect(exportAction_, &QAction::triggered, this, &OBSReplayBufferPanel::ExportSelection);
+	connect(exportAction_, &QAction::triggered, this, &OBSReplayPanel::ExportSelection);
 
 	exportButton_ = new QToolButton(this);
 	exportButton_->setAutoRaise(true);
@@ -1076,9 +1076,9 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	collapseButton_->setAutoRaise(true);
 	collapseButton_->setFocusPolicy(Qt::NoFocus);
 	collapseButton_->setIconSize(QSize(iconSize, iconSize));
-	connect(collapseButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::ToggleCollapsed);
+	connect(collapseButton_, &QToolButton::clicked, this, &OBSReplayPanel::ToggleCollapsed);
 
-	timeline_ = new OBSReplayBufferTimeline(this);
+	timeline_ = new OBSReplayTimeline(this);
 
 	/* The scale takes the whole left side and every control is grouped at the
 	 * right end: keyframe steps, live pause/resume, export the marked clip,
@@ -1103,30 +1103,30 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	layout->addLayout(timelineRow);
 
 	infoTimer_.setInterval(1000);
-	connect(&infoTimer_, &QTimer::timeout, this, &OBSReplayBufferPanel::RefreshInfo);
+	connect(&infoTimer_, &QTimer::timeout, this, &OBSReplayPanel::RefreshInfo);
 
 	fullFrameTimer_.setInterval(50);
-	connect(&fullFrameTimer_, &QTimer::timeout, this, &OBSReplayBufferPanel::PollFullFrame);
+	connect(&fullFrameTimer_, &QTimer::timeout, this, &OBSReplayPanel::PollFullFrame);
 
 	exportTimer_.setInterval(200);
-	connect(&exportTimer_, &QTimer::timeout, this, &OBSReplayBufferPanel::PollExport);
+	connect(&exportTimer_, &QTimer::timeout, this, &OBSReplayPanel::PollExport);
 
-	connect(timeline_, &OBSReplayBufferTimeline::PositionChanged, this, &OBSReplayBufferPanel::PositionChanged);
-	connect(timeline_, &OBSReplayBufferTimeline::SelectionChanged, this, &OBSReplayBufferPanel::SelectionChanged);
-	connect(timeline_, &OBSReplayBufferTimeline::GoLiveRequested, this, &OBSReplayBufferPanel::GoLive);
-	connect(timeline_, &OBSReplayBufferTimeline::MarkerDoubleClicked, this,
-		&OBSReplayBufferPanel::MarkerDoubleClicked);
-	connect(goLiveButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::ToggleLivePause);
-	connect(prevButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::PreviousKeyframe);
-	connect(nextButton_, &QToolButton::clicked, this, &OBSReplayBufferPanel::NextKeyframe);
+	connect(timeline_, &OBSReplayTimeline::PositionChanged, this, &OBSReplayPanel::PositionChanged);
+	connect(timeline_, &OBSReplayTimeline::SelectionChanged, this, &OBSReplayPanel::SelectionChanged);
+	connect(timeline_, &OBSReplayTimeline::GoLiveRequested, this, &OBSReplayPanel::GoLive);
+	connect(timeline_, &OBSReplayTimeline::MarkerDoubleClicked, this,
+		&OBSReplayPanel::MarkerDoubleClicked);
+	connect(goLiveButton_, &QToolButton::clicked, this, &OBSReplayPanel::ToggleLivePause);
+	connect(prevButton_, &QToolButton::clicked, this, &OBSReplayPanel::PreviousKeyframe);
+	connect(nextButton_, &QToolButton::clicked, this, &OBSReplayPanel::NextKeyframe);
 
 	UpdateCollapsedState();
 	/* The fold button lives in the preview's control row now; it only appears
-	 * once the replay buffer actually runs. */
+	 * once the replay actually runs. */
 	ShowPanel(false);
 }
 
-void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, QWidget *reference)
+void OBSReplayPanel::SetCollapseButtonLayout(QLayout *layout, QWidget *reference)
 {
 	if (!layout || !collapseButton_) {
 		return;
@@ -1138,7 +1138,7 @@ void OBSReplayBufferPanel::SetCollapseButtonLayout(QLayout *layout, QWidget *ref
 	UpdateCollapseButtonSize();
 }
 
-void OBSReplayBufferPanel::UpdateCollapseButtonSize()
+void OBSReplayPanel::UpdateCollapseButtonSize()
 {
 	if (!collapseButton_) {
 		return;
@@ -1167,7 +1167,7 @@ void OBSReplayBufferPanel::UpdateCollapseButtonSize()
 	ApplyCollapseIcon();
 }
 
-void OBSReplayBufferPanel::ApplyCollapseIcon()
+void OBSReplayPanel::ApplyCollapseIcon()
 {
 	if (!collapseButton_) {
 		return;
@@ -1186,7 +1186,7 @@ void OBSReplayBufferPanel::ApplyCollapseIcon()
 	collapseButton_->setIcon(QIcon(pixmap));
 }
 
-OBSReplayBufferPanel::~OBSReplayBufferPanel()
+OBSReplayPanel::~OBSReplayPanel()
 {
 	/* Stop drawing into the preview before this object goes away. The display
 	 * may already be gone (OBSBasic::OBSClose destroys it first); in that case
@@ -1219,13 +1219,13 @@ OBSReplayBufferPanel::~OBSReplayBufferPanel()
 	}
 }
 
-void OBSReplayBufferPanel::resizeEvent(QResizeEvent *event)
+void OBSReplayPanel::resizeEvent(QResizeEvent *event)
 {
 	QWidget::resizeEvent(event);
 	UpdateCompactness();
 }
 
-void OBSReplayBufferPanel::changeEvent(QEvent *event)
+void OBSReplayPanel::changeEvent(QEvent *event)
 {
 	QWidget::changeEvent(event);
 
@@ -1237,14 +1237,14 @@ void OBSReplayBufferPanel::changeEvent(QEvent *event)
 	}
 }
 
-void OBSReplayBufferPanel::Start()
+void OBSReplayPanel::Start()
 {
 	if (visible_) {
 		return;
 	}
 
 	visible_ = true;
-	/* A new replay buffer session starts at the live edge even when the
+	/* A new replay session starts at the live edge even when the
 	 * previous one was left parked in the middle of the buffer. */
 	followLive_ = true;
 	positionUsec_ = 0;
@@ -1260,25 +1260,25 @@ void OBSReplayBufferPanel::Start()
 	}
 }
 
-void OBSReplayBufferPanel::Stop()
+void OBSReplayPanel::Stop()
 {
 	visible_ = false;
 	HidePanel();
 }
 
-bool OBSReplayBufferPanel::Active() const
+bool OBSReplayPanel::Active() const
 {
 	return main_ && main_->ReplayBufferActive();
 }
 
-bool OBSReplayBufferPanel::Reviewing() const
+bool OBSReplayPanel::Reviewing() const
 {
 	/* Same 200 ms window as followLive_: at the live edge the program preview
 	 * already shows this moment, so the canvas does not need a frozen frame. */
 	return visible_ && Active() && rangeEndUsec_ > rangeStartUsec_ && positionUsec_ < rangeEndUsec_ - 200000;
 }
 
-void OBSReplayBufferPanel::UpdateReviewState()
+void OBSReplayPanel::UpdateReviewState()
 {
 	const bool reviewing = Reviewing();
 
@@ -1302,7 +1302,7 @@ void OBSReplayBufferPanel::UpdateReviewState()
 	timeline_->SetFrozen(reviewing);
 }
 
-void OBSReplayBufferPanel::AttachReviewDisplay(OBSQTDisplay *display)
+void OBSReplayPanel::AttachReviewDisplay(OBSQTDisplay *display)
 {
 	if (!display) {
 		return;
@@ -1317,7 +1317,7 @@ void OBSReplayBufferPanel::AttachReviewDisplay(OBSQTDisplay *display)
 	obs_display_add_draw_callback(handle, DrawReviewFrame, this);
 }
 
-void OBSReplayBufferPanel::SetReviewActive(bool active)
+void OBSReplayPanel::SetReviewActive(bool active)
 {
 	std::lock_guard<std::mutex> lock(reviewMutex_);
 
@@ -1333,7 +1333,7 @@ void OBSReplayBufferPanel::SetReviewActive(bool active)
 	}
 }
 
-void OBSReplayBufferPanel::SetReviewFrame(const QImage &image)
+void OBSReplayPanel::SetReviewFrame(const QImage &image)
 {
 	if (image.isNull()) {
 		return;
@@ -1350,24 +1350,24 @@ void OBSReplayBufferPanel::SetReviewFrame(const QImage &image)
 	reviewPending_ = frame;
 }
 
-void OBSReplayBufferPanel::ClearReviewFrame()
+void OBSReplayPanel::ClearReviewFrame()
 {
 	std::lock_guard<std::mutex> lock(reviewMutex_);
 	reviewPending_ = QImage();
 	reviewClear_ = true;
 }
 
-void OBSReplayBufferPanel::DrawReviewFrame(void *param, uint32_t cx, uint32_t cy)
+void OBSReplayPanel::DrawReviewFrame(void *param, uint32_t cx, uint32_t cy)
 {
 	if (param) {
-		static_cast<OBSReplayBufferPanel *>(param)->RenderReviewFrame(cx, cy);
+		static_cast<OBSReplayPanel *>(param)->RenderReviewFrame(cx, cy);
 	}
 }
 
 /* Runs on the graphics thread with the graphics context current: the reviewed
  * frame is uploaded as a texture and drawn into the preview's own surface, so
  * no window is stacked on top of the canvas. */
-void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
+void OBSReplayPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 {
 	QImage pending;
 	bool active;
@@ -1471,7 +1471,7 @@ void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 	gs_viewport_pop();
 }
 
-void OBSReplayBufferPanel::ShowPanel(bool show)
+void OBSReplayPanel::ShowPanel(bool show)
 {
 	const bool changed = isHidden() == show;
 	setVisible(show);
@@ -1486,7 +1486,7 @@ void OBSReplayBufferPanel::ShowPanel(bool show)
 	collapseButton_->setVisible(show);
 }
 
-void OBSReplayBufferPanel::HidePanel()
+void OBSReplayPanel::HidePanel()
 {
 	infoTimer_.stop();
 	fullFrameTimer_.stop();
@@ -1511,7 +1511,7 @@ void OBSReplayBufferPanel::HidePanel()
 	ShowPanel(false);
 }
 
-void OBSReplayBufferPanel::UpdatePanelHeight()
+void OBSReplayPanel::UpdatePanelHeight()
 {
 	/* Hiding rows changes the layout's size hint, but the preview column only
 	 * re-reads it once the geometry is invalidated explicitly. */
@@ -1522,7 +1522,7 @@ void OBSReplayBufferPanel::UpdatePanelHeight()
 	updateGeometry();
 }
 
-void OBSReplayBufferPanel::UpdateCompactness()
+void OBSReplayPanel::UpdateCompactness()
 {
 	/* Fold controls by priority instead of squeezing them when the preview
 	 * column gets narrow. The thresholds follow the docked panel width, which
@@ -1533,7 +1533,7 @@ void OBSReplayBufferPanel::UpdateCompactness()
 	nextButton_->setVisible(expanded && wideEnough);
 }
 
-void OBSReplayBufferPanel::UpdateCollapsedState()
+void OBSReplayPanel::UpdateCollapsedState()
 {
 	ApplyCollapseIcon();
 
@@ -1561,20 +1561,20 @@ void OBSReplayBufferPanel::UpdateCollapsedState()
 	UpdatePanelHeight();
 }
 
-void OBSReplayBufferPanel::UpdateSecondaryTextColors()
+void OBSReplayPanel::UpdateSecondaryTextColors()
 {
 	QPalette secondary = palette();
 	secondary.setColor(QPalette::WindowText, palette().color(QPalette::Disabled, QPalette::WindowText));
 	cacheLabel_->setPalette(secondary);
 }
 
-void OBSReplayBufferPanel::ToggleCollapsed()
+void OBSReplayPanel::ToggleCollapsed()
 {
 	collapsed_ = !collapsed_;
 	UpdateCollapsedState();
 }
 
-void OBSReplayBufferPanel::RefreshInfo()
+void OBSReplayPanel::RefreshInfo()
 {
 	if (!visible_) {
 		return;
@@ -1590,7 +1590,7 @@ void OBSReplayBufferPanel::RefreshInfo()
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		ShowPanel(false);
 		SetReviewActive(false);
@@ -1599,7 +1599,7 @@ void OBSReplayBufferPanel::RefreshInfo()
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	calldata_t cd = {0};
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_INFO, &cd);
+	proc_handler_call(ph, REPLAY_PROC_GET_INFO, &cd);
 
 	const int64_t start = calldata_int(&cd, "start_time_usec");
 	const int64_t end = calldata_int(&cd, "end_time_usec");
@@ -1724,17 +1724,17 @@ void OBSReplayBufferPanel::RefreshInfo()
 	UpdateReviewState();
 }
 
-void OBSReplayBufferPanel::UpdateLabels()
+void OBSReplayPanel::UpdateLabels()
 {
 	/* The axis and its markers carry the timing; the only text left is status,
 	 * and it takes no room when idle. */
 	QString text;
 	if (exportRunning_) {
-		text = QTStr("Basic.Main.Preview.ReplayBuffer.Exporting");
+		text = QTStr("Basic.Main.Preview.Replay.Exporting");
 	} else if (reviewStale_) {
 		/* The canvas keeps the previous frame when decoding fails; say so instead
 		 * of leaving the user with a picture that does not match the playhead. */
-		text = QTStr("Basic.Main.Preview.ReplayBuffer.StaleFrame");
+		text = QTStr("Basic.Main.Preview.Replay.StaleFrame");
 	}
 
 	cacheLabel_->setText(text);
@@ -1742,7 +1742,7 @@ void OBSReplayBufferPanel::UpdateLabels()
 	cacheLabel_->setVisible(!collapsed_ && !text.isEmpty());
 }
 
-void OBSReplayBufferPanel::SetReviewStale(bool stale)
+void OBSReplayPanel::SetReviewStale(bool stale)
 {
 	/* At the live edge the canvas shows the program, not a reviewed frame, so
 	 * there is no stale picture to warn about. */
@@ -1758,7 +1758,7 @@ void OBSReplayBufferPanel::SetReviewStale(bool stale)
 	UpdateLabels();
 }
 
-void OBSReplayBufferPanel::UpdateControls()
+void OBSReplayPanel::UpdateControls()
 {
 	const bool usable = Active() && !exportRunning_;
 
@@ -1770,7 +1770,7 @@ void OBSReplayBufferPanel::UpdateControls()
 	exportAction_->setEnabled(usable && timeline_->HasSelection());
 }
 
-void OBSReplayBufferPanel::UpdateGoLiveState()
+void OBSReplayPanel::UpdateGoLiveState()
 {
 	const bool usable = Active() && !exportRunning_;
 	const bool parked = Reviewing();
@@ -1779,7 +1779,7 @@ void OBSReplayBufferPanel::UpdateGoLiveState()
 	goLiveButton_->setIcon(ThemeIcon(parked ? "media/media_play.svg" : "media/media_pause.svg"));
 }
 
-void OBSReplayBufferPanel::ToggleLivePause()
+void OBSReplayPanel::ToggleLivePause()
 {
 	if (!Active() || exportRunning_) {
 		return;
@@ -1801,7 +1801,7 @@ void OBSReplayBufferPanel::ToggleLivePause()
 	RequestFrame();
 }
 
-void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
+void OBSReplayPanel::PositionChanged(qint64 position_usec, bool finished)
 {
 	if (!visible_ || !Active()) {
 		return;
@@ -1840,7 +1840,7 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	}
 }
 
-void OBSReplayBufferPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
+void OBSReplayPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
 {
 	Q_UNUSED(end_usec);
 
@@ -1859,13 +1859,13 @@ void OBSReplayBufferPanel::SelectionChanged(qint64 start_usec, qint64 end_usec)
 	UpdateControls();
 }
 
-void OBSReplayBufferPanel::RequestFrame(bool snap)
+void OBSReplayPanel::RequestFrame(bool snap)
 {
 	if (!visible_ || !Active()) {
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		return;
 	}
@@ -1876,7 +1876,7 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 	 * whether the moment is still inside a GOP at all. */
 	calldata_t query = {0};
 	calldata_set_int(&query, "time_usec", positionUsec_);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &query);
+	proc_handler_call(ph, REPLAY_PROC_FIND_KEYFRAME, &query);
 
 	const long long ordinal = calldata_int(&query, "ordinal");
 	const int64_t dts = calldata_int(&query, "dts_usec");
@@ -1914,13 +1914,13 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 	RequestFullFrame(dts);
 }
 
-void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
+void OBSReplayPanel::RequestFullFrame(int64_t time_usec)
 {
 	if (!visible_ || !Active()) {
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		return;
 	}
@@ -1931,7 +1931,7 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", time_usec);
 	calldata_set_int(&cd, "request_id", (long long)requestId);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_REQUEST_FULL_FRAME, &cd);
+	proc_handler_call(ph, REPLAY_PROC_REQUEST_FULL_FRAME, &cd);
 	const long long accepted = calldata_int(&cd, "accepted");
 	calldata_free(&cd);
 
@@ -1947,13 +1947,13 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 	fullFrameTimer_.start();
 }
 
-void OBSReplayBufferPanel::CancelFullFrame()
+void OBSReplayPanel::CancelFullFrame()
 {
 	fullFramePending_ = false;
 	fullFrameTimer_.stop();
 }
 
-void OBSReplayBufferPanel::PollFullFrame()
+void OBSReplayPanel::PollFullFrame()
 {
 	if (!fullFramePending_) {
 		fullFrameTimer_.stop();
@@ -1965,7 +1965,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		CancelFullFrame();
 		return;
@@ -1977,7 +1977,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_set_int(&query, "request_id", (long long)pendingFullFrameId_);
 	calldata_set_int(&query, "capacity", 0);
 	calldata_set_ptr(&query, "dst", nullptr);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_COPY_FULL_FRAME, &query);
+	proc_handler_call(ph, REPLAY_PROC_COPY_FULL_FRAME, &query);
 
 	const int status = (int)calldata_int(&query, "status");
 	const int width = (int)calldata_int(&query, "width");
@@ -1985,9 +1985,9 @@ void OBSReplayBufferPanel::PollFullFrame()
 	const long long size = calldata_int(&query, "size");
 	calldata_free(&query);
 
-	if (status == REPLAY_BUFFER_FRAME_PENDING) {
+	if (status == REPLAY_FRAME_PENDING) {
 		if (fullFrameElapsed_.elapsed() > 3000) {
-			blog(LOG_INFO, "[replay buffer] review: decode timed out");
+			blog(LOG_INFO, "[replay] review: decode timed out");
 			CancelFullFrame();
 			SetReviewStale(true);
 		}
@@ -1997,7 +1997,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	fullFrameTimer_.stop();
 	fullFramePending_ = false;
 
-	if (status == REPLAY_BUFFER_FRAME_FAILED || size <= 0 || width <= 0 || height <= 0) {
+	if (status == REPLAY_FRAME_FAILED || size <= 0 || width <= 0 || height <= 0) {
 		SetReviewStale(true);
 		return;
 	}
@@ -2012,13 +2012,13 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_set_int(&copy, "request_id", (long long)pendingFullFrameId_);
 	calldata_set_int(&copy, "capacity", (long long)image.sizeInBytes());
 	calldata_set_ptr(&copy, "dst", image.bits());
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_COPY_FULL_FRAME, &copy);
+	proc_handler_call(ph, REPLAY_PROC_COPY_FULL_FRAME, &copy);
 
 	const int copyStatus = (int)calldata_int(&copy, "status");
 	const long long copied = calldata_int(&copy, "size");
 	calldata_free(&copy);
 
-	if (copyStatus != REPLAY_BUFFER_FRAME_READY || copied <= 0) {
+	if (copyStatus != REPLAY_FRAME_READY || copied <= 0) {
 		SetReviewStale(true);
 		return;
 	}
@@ -2031,7 +2031,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	}
 }
 
-void OBSReplayBufferPanel::GoLive()
+void OBSReplayPanel::GoLive()
 {
 	if (!Active() || exportRunning_) {
 		return;
@@ -2049,13 +2049,13 @@ void OBSReplayBufferPanel::GoLive()
 	UpdateReviewState();
 }
 
-void OBSReplayBufferPanel::PreviousKeyframe()
+void OBSReplayPanel::PreviousKeyframe()
 {
 	if (!visible_ || !Active() || exportRunning_) {
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		return;
 	}
@@ -2064,7 +2064,7 @@ void OBSReplayBufferPanel::PreviousKeyframe()
 
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", positionUsec_);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_PREV_KEYFRAME, &cd);
+	proc_handler_call(ph, REPLAY_PROC_FIND_PREV_KEYFRAME, &cd);
 	const int ordinal = (int)calldata_int(&cd, "ordinal");
 	const int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
@@ -2076,13 +2076,13 @@ void OBSReplayBufferPanel::PreviousKeyframe()
 	JumpTo(dts);
 }
 
-void OBSReplayBufferPanel::NextKeyframe()
+void OBSReplayPanel::NextKeyframe()
 {
 	if (!visible_ || !Active() || exportRunning_) {
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		return;
 	}
@@ -2091,7 +2091,7 @@ void OBSReplayBufferPanel::NextKeyframe()
 
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", positionUsec_);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_NEXT_KEYFRAME, &cd);
+	proc_handler_call(ph, REPLAY_PROC_FIND_NEXT_KEYFRAME, &cd);
 	const int ordinal = (int)calldata_int(&cd, "ordinal");
 	const int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
@@ -2103,13 +2103,13 @@ void OBSReplayBufferPanel::NextKeyframe()
 	JumpTo(dts);
 }
 
-void OBSReplayBufferPanel::MarkerDoubleClicked()
+void OBSReplayPanel::MarkerDoubleClicked()
 {
 	if (!visible_ || !Active() || exportRunning_) {
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		return;
 	}
@@ -2120,7 +2120,7 @@ void OBSReplayBufferPanel::MarkerDoubleClicked()
 	 * decodable boundary rather than the exact pixel under the marker. */
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", positionUsec_);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &cd);
+	proc_handler_call(ph, REPLAY_PROC_FIND_KEYFRAME, &cd);
 	const int ordinal = (int)calldata_int(&cd, "ordinal");
 	const int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
@@ -2128,15 +2128,15 @@ void OBSReplayBufferPanel::MarkerDoubleClicked()
 	if (ordinal < 0) {
 		/* The keyframe may have rolled out between the last refresh and this
 		 * click; report it instead of silently doing nothing. */
-		QMessageBox::warning(main_, QTStr("Basic.Main.Preview.ReplayBuffer.Title"),
-				     QTStr("Basic.Main.Preview.ReplayBuffer.KeyframeUnavailable"));
+		QMessageBox::warning(main_, QTStr("Basic.Main.Preview.Replay.Title"),
+				     QTStr("Basic.Main.Preview.Replay.KeyframeUnavailable"));
 		return;
 	}
 
 	timeline_->MoveSelectionEndpoint(dts);
 }
 
-void OBSReplayBufferPanel::JumpTo(int64_t position_usec)
+void OBSReplayPanel::JumpTo(int64_t position_usec)
 {
 	positionUsec_ = qBound(rangeStartUsec_, position_usec, rangeEndUsec_);
 	const bool wasFollowingLive = followLive_;
@@ -2155,14 +2155,14 @@ void OBSReplayBufferPanel::JumpTo(int64_t position_usec)
 	RequestFrame();
 }
 
-void OBSReplayBufferPanel::SaveReplay()
+void OBSReplayPanel::SaveReplay()
 {
 	if (Active()) {
 		main_->ReplayBufferSave();
 	}
 }
 
-void OBSReplayBufferPanel::ExportSelection()
+void OBSReplayPanel::ExportSelection()
 {
 	if (!visible_ || !Active() || exportRunning_) {
 		return;
@@ -2172,7 +2172,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	 * the window that is actually buffered and let the cache snap the start to a
 	 * keyframe; the values it settles on come back below. */
 	if (!timeline_->HasSelection()) {
-		ShowExportError(REPLAY_BUFFER_EXPORT_ERR_INVALID);
+		ShowExportError(REPLAY_EXPORT_ERR_INVALID);
 		return;
 	}
 
@@ -2181,16 +2181,16 @@ void OBSReplayBufferPanel::ExportSelection()
 	const int64_t selectionEnd = live_end ? rangeEndUsec_
 					      : qBound(rangeStartUsec_, timeline_->SelectionEnd(), rangeEndUsec_);
 
-	blog(LOG_INFO, "[replay buffer] export: %.3fs - %.3fs (live end %d, range %.3fs - %.3fs)",
+	blog(LOG_INFO, "[replay] export: %.3fs - %.3fs (live end %d, range %.3fs - %.3fs)",
 	     (double)selectionStart / 1000000.0, (double)selectionEnd / 1000000.0, live_end,
 	     (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
 
 	if (selectionEnd <= selectionStart) {
-		ShowExportError(REPLAY_BUFFER_EXPORT_ERR_INVALID);
+		ShowExportError(REPLAY_EXPORT_ERR_INVALID);
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		return;
 	}
@@ -2200,17 +2200,17 @@ void OBSReplayBufferPanel::ExportSelection()
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "start_usec", selectionStart);
 	calldata_set_int(&cd, "end_usec", selectionEnd);
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_EXPORT_SELECTION, &cd);
+	proc_handler_call(ph, REPLAY_PROC_EXPORT_SELECTION, &cd);
 
 	const int result = (int)calldata_int(&cd, "result");
 	const int64_t actualStart = calldata_int(&cd, "actual_start_usec");
 	const int64_t actualEnd = calldata_int(&cd, "actual_end_usec");
 	calldata_free(&cd);
 
-	blog(LOG_INFO, "[replay buffer] export result %d (%.3fs - %.3fs)", result, (double)actualStart / 1000000.0,
+	blog(LOG_INFO, "[replay] export result %d (%.3fs - %.3fs)", result, (double)actualStart / 1000000.0,
 	     (double)actualEnd / 1000000.0);
 
-	if (result != REPLAY_BUFFER_EXPORT_ERR_NONE) {
+	if (result != REPLAY_EXPORT_ERR_NONE) {
 		ShowExportError(result);
 		return;
 	}
@@ -2229,7 +2229,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	UpdateLabels();
 }
 
-void OBSReplayBufferPanel::PollExport()
+void OBSReplayPanel::PollExport()
 {
 	if (!exportRunning_) {
 		exportTimer_.stop();
@@ -2244,7 +2244,7 @@ void OBSReplayBufferPanel::PollExport()
 		return;
 	}
 
-	OBSOutputAutoRelease output = main_->GetReplayBufferOutput();
+	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
 		exportRunning_ = false;
 		exportTimer_.stop();
@@ -2256,12 +2256,12 @@ void OBSReplayBufferPanel::PollExport()
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 
 	calldata_t cd = {0};
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_EXPORT_STATUS, &cd);
+	proc_handler_call(ph, REPLAY_PROC_GET_EXPORT_STATUS, &cd);
 	const int state = (int)calldata_int(&cd, "state");
 	const int error = (int)calldata_int(&cd, "error");
 	calldata_free(&cd);
 
-	if (state == REPLAY_BUFFER_EXPORT_RUNNING) {
+	if (state == REPLAY_EXPORT_RUNNING) {
 		if (exportElapsed_.elapsed() > kExportTimeoutMs) {
 			/* Free the UI without touching the mux thread: the helper may still be
 			 * writing, but the controls must not stay disabled forever. */
@@ -2269,8 +2269,8 @@ void OBSReplayBufferPanel::PollExport()
 			exportTimer_.stop();
 			UpdateControls();
 			UpdateLabels();
-			QMessageBox::warning(main_, QTStr("Basic.Main.Preview.ReplayBuffer.Title"),
-					     QTStr("Basic.Main.Preview.ReplayBuffer.ExportTimeout"));
+			QMessageBox::warning(main_, QTStr("Basic.Main.Preview.Replay.Title"),
+					     QTStr("Basic.Main.Preview.Replay.ExportTimeout"));
 		}
 		return;
 	}
@@ -2280,13 +2280,13 @@ void OBSReplayBufferPanel::PollExport()
 	UpdateControls();
 	UpdateLabels();
 
-	if (state != REPLAY_BUFFER_EXPORT_DONE) {
+	if (state != REPLAY_EXPORT_DONE) {
 		ShowExportError(error);
 		return;
 	}
 
 	calldata_t pathCd = {0};
-	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_LAST_REPLAY, &pathCd);
+	proc_handler_call(ph, REPLAY_PROC_GET_LAST_REPLAY, &pathCd);
 	const char *lastPath = calldata_string(&pathCd, "path");
 	const std::string path = lastPath ? lastPath : "";
 	calldata_free(&pathCd);
@@ -2294,31 +2294,31 @@ void OBSReplayBufferPanel::PollExport()
 	/* Reported in the status bar like a whole-buffer save, but without going
 	 * through ReplayBufferSaved(): that slot also raises the frontend event and
 	 * starts AutoRemux, and a trimmed export must not trigger either. */
-	main_->ShowStatusBarMessage(QTStr("Basic.StatusBar.ReplayBufferSelectionSavedTo").arg(QT_UTF8(path.c_str())));
+	main_->ShowStatusBarMessage(QTStr("Basic.StatusBar.ReplaySelectionSavedTo").arg(QT_UTF8(path.c_str())));
 }
 
-void OBSReplayBufferPanel::ShowExportError(int error)
+void OBSReplayPanel::ShowExportError(int error)
 {
 	QString message;
 
 	switch (error) {
-	case REPLAY_BUFFER_EXPORT_ERR_INVALID:
-		message = QTStr("Basic.Main.Preview.ReplayBuffer.ExportInvalid");
+	case REPLAY_EXPORT_ERR_INVALID:
+		message = QTStr("Basic.Main.Preview.Replay.ExportInvalid");
 		break;
-	case REPLAY_BUFFER_EXPORT_ERR_BUSY:
-		message = QTStr("Basic.Main.Preview.ReplayBuffer.ExportBusy");
+	case REPLAY_EXPORT_ERR_BUSY:
+		message = QTStr("Basic.Main.Preview.Replay.ExportBusy");
 		break;
-	case REPLAY_BUFFER_EXPORT_ERR_INACTIVE:
-		message = QTStr("Basic.Main.Preview.ReplayBuffer.NotRunning");
+	case REPLAY_EXPORT_ERR_INACTIVE:
+		message = QTStr("Basic.Main.Preview.Replay.NotRunning");
 		break;
-	case REPLAY_BUFFER_EXPORT_ERR_WRITE:
+	case REPLAY_EXPORT_ERR_WRITE:
 	default:
-		message = QTStr("Basic.Main.Preview.ReplayBuffer.ExportWriteFailed");
+		message = QTStr("Basic.Main.Preview.Replay.ExportWriteFailed");
 		break;
 	}
 
 	/* A failed selection export is reported in the status bar as well, so it
 	 * never blocks the preview with a modal dialog. The reason stays the same
 	 * wording the dialog used. */
-	main_->ShowStatusBarMessage(QTStr("Basic.StatusBar.ReplayBufferSelectionFailed").arg(message));
+	main_->ShowStatusBarMessage(QTStr("Basic.StatusBar.ReplaySelectionFailed").arg(message));
 }

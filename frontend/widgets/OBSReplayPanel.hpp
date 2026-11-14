@@ -23,17 +23,17 @@ class QPainter;
 class QTimer;
 class QToolButton;
 
-/* Minimal timeline widget used by the replay buffer panel. It deliberately
+/* Minimal timeline widget used by the replay panel. It deliberately
  * keeps only the geometry/selection state; all proc calls live in the panel, so
  * the widget stays a pure view and can be reused. */
-class OBSReplayBufferTimeline : public QWidget {
+class OBSReplayTimeline : public QWidget {
 	Q_OBJECT
 
 public:
-	explicit OBSReplayBufferTimeline(QWidget *parent = nullptr);
+	explicit OBSReplayTimeline(QWidget *parent = nullptr);
 
 	void SetRange(int64_t start_usec, int64_t end_usec);
-	/* Configured replay buffer length limit; the axis always spans it, so the
+	/* Configured replay length limit; the axis always spans it, so the
 	 * scale does not grow while the buffer is still filling up. 0 falls back to
 	 * the buffered span (unlimited buffer). */
 	void SetMaxDuration(int64_t max_usec);
@@ -130,17 +130,17 @@ private:
 	bool hovering_ = false;
 };
 
-/* Replay buffer controls docked under the program preview, below the zoom
+/* Replay controls docked under the program preview, below the zoom
  * controls and the scroll bars. The widget is a normal member of the preview
  * layout, so it never covers the program output. */
-class OBSReplayBufferPanel : public QWidget {
+class OBSReplayPanel : public QWidget {
 	Q_OBJECT
 
 public:
 	/* preview is the program output widget; the reviewed frame is drawn into
 	 * its OBS display, so the canvas itself shows the selected moment. */
-	OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview);
-	~OBSReplayBufferPanel() override;
+	OBSReplayPanel(OBSBasic *main, OBSQTDisplay *preview);
+	~OBSReplayPanel() override;
 
 	/* Hands the fold button to the preview's own control row, so it sits next to
 	 * the horizontal scroll bar instead of the playback row. When a reference
@@ -215,7 +215,7 @@ private:
 	/* Glyph size picked for the fold button when it joins the preview row. */
 	int collapseIconSide_ = 12;
 	QPointer<QWidget> foldReference_;
-	OBSReplayBufferTimeline *timeline_ = nullptr;
+	OBSReplayTimeline *timeline_ = nullptr;
 
 	/* The reviewed frame is uploaded as a texture on the graphics thread and
 	 * drawn by a display draw callback, so the canvas itself shows it without

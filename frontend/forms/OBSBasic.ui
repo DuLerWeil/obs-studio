@@ -261,14 +261,14 @@
                 <number>0</number>
                </property>
                <item>
-                <widget class="QWidget" name="replayBufferContainer">
+                <widget class="QWidget" name="replayContainer">
                  <property name="sizePolicy">
                   <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
                    <horstretch>0</horstretch>
                    <verstretch>0</verstretch>
                   </sizepolicy>
                  </property>
-                 <layout class="QVBoxLayout" name="replayBufferContainerLayout">
+                 <layout class="QVBoxLayout" name="replayContainerLayout">
                   <property name="spacing">
                    <number>0</number>
                   </property>

@@ -47,7 +47,7 @@
 #endif
 #include <widgets/AudioMixer.hpp>
 #include <widgets/OBSProjector.hpp>
-#include <widgets/OBSReplayBufferPanel.hpp>
+#include <widgets/OBSReplayPanel.hpp>
 
 #include <OBSStudioAPI.hpp>
 #ifdef BROWSER_AVAILABLE
@@ -140,18 +140,18 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	ui->setupUi(this);
 	ui->previewDisabledWidget->setVisible(false);
 
-	/* Replay buffer timeline docked under the preview, below the zoom controls
+	/* Replay timeline docked under the preview, below the zoom controls
 	 * and the scroll bars. It is part of the preview column, so projector
 	 * windows never show it and it never covers the program output. */
-	auto *replayPanel = new OBSReplayBufferPanel(this, ui->preview);
-	replayBufferPanel = replayPanel;
-	ui->replayBufferContainerLayout->addWidget(replayPanel);
+	auto *panel = new OBSReplayPanel(this, ui->preview);
+	replayPanel = panel;
+	ui->replayContainerLayout->addWidget(panel);
 	/* The fold button sits at the right end of the preview's own control row,
 	 * next to the horizontal scroll bar. */
-	replayPanel->SetCollapseButtonLayout(ui->horizontalLayout_7, ui->previewScalingMode);
-	connect(this, &OBSBasic::ReplayBufStarted, replayPanel, &OBSReplayBufferPanel::Start);
-	connect(this, &OBSBasic::ReplayBufStopping, replayPanel, &OBSReplayBufferPanel::Stop);
-	connect(this, &OBSBasic::ReplayBufStopped, replayPanel, &OBSReplayBufferPanel::Stop);
+	panel->SetCollapseButtonLayout(ui->horizontalLayout_7, ui->previewScalingMode);
+	connect(this, &OBSBasic::ReplayBufStarted, panel, &OBSReplayPanel::Start);
+	connect(this, &OBSBasic::ReplayBufStopping, panel, &OBSReplayPanel::Stop);
+	connect(this, &OBSBasic::ReplayBufStopped, panel, &OBSReplayPanel::Stop);
 
 	/* Set up streaming connections */
 	connect(

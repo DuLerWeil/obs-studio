@@ -20,7 +20,7 @@
 #include "obs-ffmpeg-replay-buffer.h"
 #include "obs-ffmpeg-replay-buffer-frame-decoder.h"
 
-#include <obs-replay-buffer-interface.h>
+#include <obs-replay-interface.h>
 
 #ifdef _WIN32
 #include "util/windows/win-version.h"
@@ -48,10 +48,10 @@ static const char *ffmpeg_mpegts_mux_getname(void *type)
 }
 #endif
 
-static inline void replay_buffer_clear(struct ffmpeg_muxer *stream)
+static inline void replay_clear(struct ffmpeg_muxer *stream)
 {
-	if (stream->replay_buffer_mutex_initialized) {
-		pthread_mutex_lock(&stream->replay_buffer_mutex);
+	if (stream->replay_mutex_initialized) {
+		pthread_mutex_lock(&stream->replay_mutex);
 	}
 
 	while (stream->packets.size > 0) {
@@ -70,8 +70,8 @@ static inline void replay_buffer_clear(struct ffmpeg_muxer *stream)
 	stream->max_time = 0;
 	stream->save_ts = 0;
 
-	if (stream->replay_buffer_mutex_initialized) {
-		pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	if (stream->replay_mutex_initialized) {
+		pthread_mutex_unlock(&stream->replay_mutex);
 	}
 }
 
@@ -80,22 +80,22 @@ static void ffmpeg_mux_destroy(void *data)
 	struct ffmpeg_muxer *stream = data;
 
 	/* The GPU encode thread may still be delivering a packet. Stop it from
-	 * entering the replay buffer, then wait for the one that is already inside
+	 * entering the replay, then wait for the one that is already inside
 	 * before anything it touches is torn down: a late packet used to reach the
 	 * cache after it was freed, which is where the buffer crashed on stop. */
-	if (stream->replay_buffer_mutex_initialized) {
-		pthread_mutex_lock(&stream->replay_buffer_mutex);
+	if (stream->replay_mutex_initialized) {
+		pthread_mutex_lock(&stream->replay_mutex);
 		os_atomic_set_bool(&stream->active, false);
 		os_atomic_set_bool(&stream->stopping, false);
 		stream->replay_shutdown = true;
 
 		if (stream->replay_cond_initialized) {
 			while (stream->replay_callbacks > 0) {
-				pthread_cond_wait(&stream->replay_cond, &stream->replay_buffer_mutex);
+				pthread_cond_wait(&stream->replay_cond, &stream->replay_mutex);
 			}
 		}
 
-		pthread_mutex_unlock(&stream->replay_buffer_mutex);
+		pthread_mutex_unlock(&stream->replay_mutex);
 	}
 
 	/* A save or a selection export may still be writing. Join it before any of
@@ -105,16 +105,16 @@ static void ffmpeg_mux_destroy(void *data)
 		stream->mux_thread_joinable = false;
 	}
 
-	replay_buffer_clear(stream);
+	replay_clear(stream);
 	replay_buffer_cache_destroy(stream->replay_cache);
 	stream->replay_cache = NULL;
 	if (stream->replay_cond_initialized) {
 		pthread_cond_destroy(&stream->replay_cond);
 		stream->replay_cond_initialized = false;
 	}
-	if (stream->replay_buffer_mutex_initialized) {
-		pthread_mutex_destroy(&stream->replay_buffer_mutex);
-		stream->replay_buffer_mutex_initialized = false;
+	if (stream->replay_mutex_initialized) {
+		pthread_mutex_destroy(&stream->replay_mutex);
+		stream->replay_mutex_initialized = false;
 	}
 	for (size_t i = 0; i < stream->mux_packets.num; i++) {
 		obs_encoder_packet_release(&stream->mux_packets.array[i]);
@@ -715,7 +715,7 @@ bool write_packet(struct ffmpeg_muxer *stream, struct encoder_packet *packet)
 		warn("os_process_pipe_write for info structure failed");
 		/* Replay saves and selection exports run on their own helper
 		 * process; a failure there must fail that file only, not stop the
-		 * live replay buffer through signal_failure(). */
+		 * live replay through signal_failure(). */
 		if (!stream->replay_mux) {
 			signal_failure(stream);
 		}
@@ -1018,7 +1018,7 @@ struct obs_output_info ffmpeg_mpegts_muxer = {
 #endif
 /* ------------------------------------------------------------------------ */
 
-static const char *replay_buffer_getname(void *type)
+static const char *replay_getname(void *type)
 {
 	UNUSED_PARAMETER(type);
 	return obs_module_text("ReplayBuffer");
@@ -1049,7 +1049,7 @@ static void get_last_replay(void *data, calldata_t *cd)
 	}
 }
 
-static void get_replay_buffer_info(void *data, calldata_t *cd)
+static void get_replay_info(void *data, calldata_t *cd)
 {
 	struct ffmpeg_muxer *stream = data;
 	struct replay_buffer_cache_info info;
@@ -1073,13 +1073,13 @@ static void get_replay_buffer_info(void *data, calldata_t *cd)
 }
 
 /* Fills the ordinal/dts/duration outputs of the find_* procs, or reports
- * REPLAY_BUFFER_INVALID_ORDINAL when the cache moved on between the lookup and
+ * REPLAY_INVALID_ORDINAL when the cache moved on between the lookup and
  * the info query. */
 static void set_replay_keyframe_result(calldata_t *cd, bool found, size_t ordinal,
 				       const struct replay_buffer_keyframe_info *frame_info)
 {
 	if (!found) {
-		calldata_set_int(cd, "ordinal", REPLAY_BUFFER_INVALID_ORDINAL);
+		calldata_set_int(cd, "ordinal", REPLAY_INVALID_ORDINAL);
 		calldata_set_int(cd, "dts_usec", 0);
 		calldata_set_int(cd, "duration_usec", 0);
 		return;
@@ -1135,11 +1135,11 @@ static void request_replay_full_frame(void *data, calldata_t *cd)
 	const uint64_t request_id = (uint64_t)calldata_int(cd, "request_id");
 	bool accepted = false;
 
-	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	pthread_mutex_lock(&stream->replay_mutex);
 	if (stream->frame_decoder) {
 		accepted = replay_buffer_frame_decoder_request(stream->frame_decoder, time_usec, request_id);
 	}
-	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	pthread_mutex_unlock(&stream->replay_mutex);
 
 	calldata_set_int(cd, "accepted", accepted ? 1 : 0);
 }
@@ -1151,17 +1151,17 @@ static void copy_replay_full_frame(void *data, calldata_t *cd)
 	const long long capacity_int = calldata_int(cd, "capacity");
 	const size_t capacity = capacity_int > 0 ? (size_t)capacity_int : 0;
 	uint8_t *dst = calldata_ptr(cd, "dst");
-	int status = REPLAY_BUFFER_FRAME_FAILED;
+	int status = REPLAY_FRAME_FAILED;
 	uint32_t width = 0;
 	uint32_t height = 0;
 	size_t size = 0;
 
-	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	pthread_mutex_lock(&stream->replay_mutex);
 	if (stream->frame_decoder) {
 		replay_buffer_frame_decoder_copy(stream->frame_decoder, request_id, dst, capacity, &status, &width,
 						 &height, &size);
 	}
-	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	pthread_mutex_unlock(&stream->replay_mutex);
 
 	calldata_set_int(cd, "status", status);
 	calldata_set_int(cd, "width", width);
@@ -1177,11 +1177,11 @@ static void get_replay_export_status(void *data, calldata_t *cd)
 	calldata_set_int(cd, "error", os_atomic_load_long(&stream->export_error));
 }
 
-static bool replay_buffer_begin_mux(struct ffmpeg_muxer *stream);
-static void replay_buffer_prepare_packets(struct ffmpeg_muxer *stream, replay_buffer_snapshot_t *snapshot);
-static void replay_buffer_make_temp_path(const char *final_path, struct dstr *temp_path);
-static void replay_buffer_free_mux_packets(struct ffmpeg_muxer *stream);
-static void *replay_buffer_mux_thread(void *data);
+static bool replay_begin_mux(struct ffmpeg_muxer *stream);
+static void replay_prepare_packets(struct ffmpeg_muxer *stream, replay_buffer_snapshot_t *snapshot);
+static void replay_make_temp_path(const char *final_path, struct dstr *temp_path);
+static void replay_free_mux_packets(struct ffmpeg_muxer *stream);
+static void *replay_mux_thread(void *data);
 
 static void export_replay_selection(void *data, calldata_t *cd)
 {
@@ -1190,12 +1190,12 @@ static void export_replay_selection(void *data, calldata_t *cd)
 	const int64_t end_usec = calldata_int(cd, "end_usec");
 	int64_t actual_start = 0;
 	int64_t actual_end = 0;
-	int result = REPLAY_BUFFER_EXPORT_ERR_INVALID;
+	int result = REPLAY_EXPORT_ERR_INVALID;
 
 	if (!active(stream)) {
-		result = REPLAY_BUFFER_EXPORT_ERR_INACTIVE;
+		result = REPLAY_EXPORT_ERR_INACTIVE;
 	} else if (start_usec >= end_usec) {
-		result = REPLAY_BUFFER_EXPORT_ERR_INVALID;
+		result = REPLAY_EXPORT_ERR_INVALID;
 	} else {
 		/* Resolve the range and take packet references in one pass. The
 		 * snapshot also reports the range the cache actually settled on, so
@@ -1205,20 +1205,20 @@ static void export_replay_selection(void *data, calldata_t *cd)
 			stream->replay_cache, start_usec, end_usec, &actual_start, &actual_end);
 
 		if (!snapshot) {
-			blog(LOG_WARNING, "[replay buffer] export: %.3fs - %.3fs does not resolve to a range",
+			blog(LOG_WARNING, "[replay] export: %.3fs - %.3fs does not resolve to a range",
 			     (double)start_usec / 1000000.0, (double)end_usec / 1000000.0);
-			result = REPLAY_BUFFER_EXPORT_ERR_INVALID;
-		} else if (!replay_buffer_begin_mux(stream)) {
+			result = REPLAY_EXPORT_ERR_INVALID;
+		} else if (!replay_begin_mux(stream)) {
 			replay_buffer_snapshot_release(snapshot);
-			result = REPLAY_BUFFER_EXPORT_ERR_BUSY;
+			result = REPLAY_EXPORT_ERR_BUSY;
 		} else {
 			stream->selection_export = true;
 			/* Only the GOPs the writer has not reached yet are protected; the
 			 * snapshot already holds its own references, but the buffered copy
 			 * must stay resolvable until it is written. */
 			replay_buffer_cache_set_pin(stream->replay_cache, actual_start, actual_end);
-			replay_buffer_prepare_packets(stream, snapshot);
-			blog(LOG_INFO, "[replay buffer] export: %zu packets for %.3fs - %.3fs", stream->mux_packets.num,
+			replay_prepare_packets(stream, snapshot);
+			blog(LOG_INFO, "[replay] export: %zu packets for %.3fs - %.3fs", stream->mux_packets.num,
 			     (double)actual_start / 1000000.0, (double)actual_end / 1000000.0);
 			replay_buffer_snapshot_release(snapshot);
 
@@ -1227,26 +1227,26 @@ static void export_replay_selection(void *data, calldata_t *cd)
 			/* A marker in the name keeps trimmed exports apart from whole-buffer
 			 * saves and from each other in the output folder. */
 			generate_filename(stream, &stream->selection_path, false, "_trimmed");
-			replay_buffer_make_temp_path(stream->selection_path.array, &stream->path);
+			replay_make_temp_path(stream->selection_path.array, &stream->path);
 			os_unlink(stream->path.array);
 
-			os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_NONE);
-			os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_RUNNING);
+			os_atomic_set_long(&stream->export_error, REPLAY_EXPORT_ERR_NONE);
+			os_atomic_set_long(&stream->export_state, REPLAY_EXPORT_RUNNING);
 
 			stream->mux_thread_joinable =
-				pthread_create(&stream->mux_thread, NULL, replay_buffer_mux_thread, stream) == 0;
+				pthread_create(&stream->mux_thread, NULL, replay_mux_thread, stream) == 0;
 			if (!stream->mux_thread_joinable) {
 				warn("Failed to create replay selection muxer thread");
-				replay_buffer_free_mux_packets(stream);
+				replay_free_mux_packets(stream);
 				stream->selection_export = false;
-				os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_FAILED);
-				os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_WRITE);
+				os_atomic_set_long(&stream->export_state, REPLAY_EXPORT_FAILED);
+				os_atomic_set_long(&stream->export_error, REPLAY_EXPORT_ERR_WRITE);
 				os_atomic_set_bool(&stream->muxing, false);
 				/* No thread was started to release the protection for us. */
 				replay_buffer_cache_clear_pin(stream->replay_cache);
-				result = REPLAY_BUFFER_EXPORT_ERR_WRITE;
+				result = REPLAY_EXPORT_ERR_WRITE;
 			} else {
-				result = REPLAY_BUFFER_EXPORT_ERR_NONE;
+				result = REPLAY_EXPORT_ERR_NONE;
 			}
 		}
 	}
@@ -1256,21 +1256,21 @@ static void export_replay_selection(void *data, calldata_t *cd)
 	calldata_set_int(cd, "actual_end_usec", actual_end);
 }
 
-static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
+static void *replay_create(obs_data_t *settings, obs_output_t *output)
 {
 	UNUSED_PARAMETER(settings);
 	struct ffmpeg_muxer *stream = bzalloc(sizeof(*stream));
 	stream->output = output;
 
-	if (pthread_mutex_init(&stream->replay_buffer_mutex, NULL) != 0) {
+	if (pthread_mutex_init(&stream->replay_mutex, NULL) != 0) {
 		bfree(stream);
 		return NULL;
 	}
-	stream->replay_buffer_mutex_initialized = true;
+	stream->replay_mutex_initialized = true;
 
 	if (pthread_cond_init(&stream->replay_cond, NULL) != 0) {
-		pthread_mutex_destroy(&stream->replay_buffer_mutex);
-		stream->replay_buffer_mutex_initialized = false;
+		pthread_mutex_destroy(&stream->replay_mutex);
+		stream->replay_mutex_initialized = false;
 		bfree(stream);
 		return NULL;
 	}
@@ -1279,8 +1279,8 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 	if (pthread_mutex_init(&stream->save_mutex, NULL) != 0) {
 		pthread_cond_destroy(&stream->replay_cond);
 		stream->replay_cond_initialized = false;
-		pthread_mutex_destroy(&stream->replay_buffer_mutex);
-		stream->replay_buffer_mutex_initialized = false;
+		pthread_mutex_destroy(&stream->replay_mutex);
+		stream->replay_mutex_initialized = false;
 		bfree(stream);
 		return NULL;
 	}
@@ -1291,53 +1291,51 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 		pthread_mutex_destroy(&stream->save_mutex);
 		pthread_cond_destroy(&stream->replay_cond);
 		stream->replay_cond_initialized = false;
-		pthread_mutex_destroy(&stream->replay_buffer_mutex);
+		pthread_mutex_destroy(&stream->replay_mutex);
 		bfree(stream);
 		return NULL;
 	}
 
-	os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_IDLE);
-	os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_NONE);
+	os_atomic_set_long(&stream->export_state, REPLAY_EXPORT_IDLE);
+	os_atomic_set_long(&stream->export_error, REPLAY_EXPORT_ERR_NONE);
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
-	proc_handler_add(ph, "void " REPLAY_BUFFER_PROC_SAVE "()", save_replay_proc, stream);
-	proc_handler_add(ph, "void " REPLAY_BUFFER_PROC_GET_LAST_REPLAY "(out string path)", get_last_replay, stream);
+	proc_handler_add(ph, "void " REPLAY_PROC_SAVE "()", save_replay_proc, stream);
+	proc_handler_add(ph, "void " REPLAY_PROC_GET_LAST_REPLAY "(out string path)", get_last_replay, stream);
 	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_GET_INFO
+			 "void " REPLAY_PROC_GET_INFO
 			 "(out int start_time_usec, out int end_time_usec, out int keyframe_count, "
 			 "out int max_time_usec, out int packet_count, out int bytes, "
 			 "out int dropped_packets, out int dropped_bytes, out int dropped_keyframes, "
 			 "out int push_failures)",
-			 get_replay_buffer_info, stream);
+			 get_replay_info, stream);
 
 	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_FIND_KEYFRAME
+			 "void " REPLAY_PROC_FIND_KEYFRAME
 			 "(int time_usec, out int ordinal, out int dts_usec, out int duration_usec)",
 			 find_replay_keyframe, stream);
 	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_FIND_PREV_KEYFRAME
+			 "void " REPLAY_PROC_FIND_PREV_KEYFRAME
 			 "(int time_usec, out int ordinal, out int dts_usec, out int duration_usec)",
 			 find_prev_replay_keyframe, stream);
 	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_FIND_NEXT_KEYFRAME
+			 "void " REPLAY_PROC_FIND_NEXT_KEYFRAME
 			 "(int time_usec, out int ordinal, out int dts_usec, out int duration_usec)",
 			 find_next_replay_keyframe, stream);
-	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_REQUEST_FULL_FRAME
-			 "(int time_usec, int request_id, out int accepted)",
+	proc_handler_add(ph, "void " REPLAY_PROC_REQUEST_FULL_FRAME "(int time_usec, int request_id, out int accepted)",
 			 request_replay_full_frame, stream);
 	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_COPY_FULL_FRAME
+			 "void " REPLAY_PROC_COPY_FULL_FRAME
 			 "(int request_id, int capacity, in ptr dst, out int status, out int width, "
 			 "out int height, out int size)",
 			 copy_replay_full_frame, stream);
 
 	proc_handler_add(ph,
-			 "void " REPLAY_BUFFER_PROC_EXPORT_SELECTION
+			 "void " REPLAY_PROC_EXPORT_SELECTION
 			 "(int start_usec, int end_usec, out int result, out int actual_start_usec, "
 			 "out int actual_end_usec)",
 			 export_replay_selection, stream);
-	proc_handler_add(ph, "void " REPLAY_BUFFER_PROC_GET_EXPORT_STATUS "(out int state, out int error)",
+	proc_handler_add(ph, "void " REPLAY_PROC_GET_EXPORT_STATUS "(out int state, out int error)",
 			 get_replay_export_status, stream);
 
 	signal_handler_t *sh = obs_output_get_signal_handler(output);
@@ -1347,12 +1345,12 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 	return stream;
 }
 
-static void replay_buffer_destroy(void *data)
+static void replay_destroy(void *data)
 {
 	ffmpeg_mux_destroy(data);
 }
 
-static bool replay_buffer_start(void *data)
+static bool replay_start(void *data)
 {
 	struct ffmpeg_muxer *stream = data;
 
@@ -1370,11 +1368,11 @@ static bool replay_buffer_start(void *data)
 
 	replay_buffer_cache_set_limits(stream->replay_cache, stream->max_size, stream->max_time);
 
-	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	pthread_mutex_lock(&stream->replay_mutex);
 	replay_buffer_frame_decoder_destroy(stream->frame_decoder);
 	stream->frame_decoder =
 		replay_buffer_frame_decoder_create(obs_output_get_video_encoder(stream->output), stream->replay_cache);
-	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	pthread_mutex_unlock(&stream->replay_mutex);
 
 	os_atomic_set_bool(&stream->active, true);
 	os_atomic_set_bool(&stream->capturing, true);
@@ -1412,7 +1410,7 @@ static void insert_packet(mux_packets_t *packets, struct encoder_packet *packet,
 	da_insert(*packets, idx, &pkt);
 }
 
-static void replay_buffer_free_mux_packets(struct ffmpeg_muxer *stream)
+static void replay_free_mux_packets(struct ffmpeg_muxer *stream)
 {
 	for (size_t i = 0; i < stream->mux_packets.num; i++) {
 		obs_encoder_packet_release(&stream->mux_packets.array[i]);
@@ -1420,7 +1418,7 @@ static void replay_buffer_free_mux_packets(struct ffmpeg_muxer *stream)
 	da_free(stream->mux_packets);
 }
 
-static void replay_buffer_make_temp_path(const char *final_path, struct dstr *temp_path)
+static void replay_make_temp_path(const char *final_path, struct dstr *temp_path)
 {
 	const char *slash = strrchr(final_path, '/');
 	const char *dot = strrchr(final_path, '.');
@@ -1435,14 +1433,14 @@ static void replay_buffer_make_temp_path(const char *final_path, struct dstr *te
 	}
 }
 
-static void *replay_buffer_mux_thread(void *data)
+static void *replay_mux_thread(void *data)
 {
 	struct ffmpeg_muxer *stream = data;
 	const bool selection_export = stream->selection_export;
 	bool error = false;
 
 	/* This thread owns its own helper process: write failures are reported
-	 * through the mux result and must not deactivate the replay buffer. */
+	 * through the mux result and must not deactivate the replay. */
 	stream->replay_mux = true;
 
 	start_pipe(stream, stream->path.array);
@@ -1516,7 +1514,7 @@ finish: {
 
 		stream->selection_export = false;
 	} else if (!error) {
-		info("Wrote replay buffer to '%s'", stream->path.array);
+		info("Wrote replay to '%s'", stream->path.array);
 	}
 
 	/* muxing must be cleared before signalling: get_last_replay only returns
@@ -1526,10 +1524,8 @@ finish: {
 	stream->replay_mux = false;
 
 	if (selection_export) {
-		os_atomic_set_long(&stream->export_error,
-				   error ? REPLAY_BUFFER_EXPORT_ERR_WRITE : REPLAY_BUFFER_EXPORT_ERR_NONE);
-		os_atomic_set_long(&stream->export_state,
-				   error ? REPLAY_BUFFER_EXPORT_FAILED : REPLAY_BUFFER_EXPORT_DONE);
+		os_atomic_set_long(&stream->export_error, error ? REPLAY_EXPORT_ERR_WRITE : REPLAY_EXPORT_ERR_NONE);
+		os_atomic_set_long(&stream->export_state, error ? REPLAY_EXPORT_FAILED : REPLAY_EXPORT_DONE);
 		/* The export is over, whether it succeeded or not: everything that was
 		 * protected can now be retired by the normal rules. This is the backend
 		 * completion, not the UI watchdog. */
@@ -1552,7 +1548,7 @@ finish: {
  * guarded: the mux thread runs without the lock and muxing keeps the other
  * path out while it writes. Called from the output thread (save) and from the
  * UI thread (export); never blocks on a running mux. */
-static bool replay_buffer_begin_mux(struct ffmpeg_muxer *stream)
+static bool replay_begin_mux(struct ffmpeg_muxer *stream)
 {
 	bool started = false;
 
@@ -1572,7 +1568,7 @@ static bool replay_buffer_begin_mux(struct ffmpeg_muxer *stream)
 	return started;
 }
 
-static void replay_buffer_prepare_packets(struct ffmpeg_muxer *stream, replay_buffer_snapshot_t *snapshot)
+static void replay_prepare_packets(struct ffmpeg_muxer *stream, replay_buffer_snapshot_t *snapshot)
 {
 	const size_t num_packets = replay_buffer_snapshot_get_packet_count(snapshot);
 
@@ -1610,21 +1606,21 @@ static void replay_buffer_prepare_packets(struct ffmpeg_muxer *stream, replay_bu
 	}
 }
 
-static bool replay_buffer_save(struct ffmpeg_muxer *stream)
+static bool replay_save(struct ffmpeg_muxer *stream)
 {
-	if (!replay_buffer_begin_mux(stream)) {
+	if (!replay_begin_mux(stream)) {
 		return false;
 	}
 
 	replay_buffer_snapshot_t *snapshot = replay_buffer_cache_create_snapshot(stream->replay_cache);
 	if (!snapshot) {
-		warn("Failed to create replay buffer snapshot");
+		warn("Failed to create replay snapshot");
 		os_atomic_set_bool(&stream->muxing, false);
 		return false;
 	}
 
 	stream->selection_export = false;
-	replay_buffer_prepare_packets(stream, snapshot);
+	replay_prepare_packets(stream, snapshot);
 	replay_buffer_snapshot_release(snapshot);
 
 	calldata_t cd = {0};
@@ -1635,10 +1631,10 @@ static bool replay_buffer_save(struct ffmpeg_muxer *stream)
 
 	generate_filename(stream, &stream->path, true, NULL);
 
-	stream->mux_thread_joinable = pthread_create(&stream->mux_thread, NULL, replay_buffer_mux_thread, stream) == 0;
+	stream->mux_thread_joinable = pthread_create(&stream->mux_thread, NULL, replay_mux_thread, stream) == 0;
 	if (!stream->mux_thread_joinable) {
 		warn("Failed to create muxer thread");
-		replay_buffer_free_mux_packets(stream);
+		replay_free_mux_packets(stream);
 		os_atomic_set_bool(&stream->muxing, false);
 		return false;
 	}
@@ -1657,43 +1653,43 @@ static void deactivate_replay_buffer(struct ffmpeg_muxer *stream, int code)
 	os_atomic_set_bool(&stream->active, false);
 	os_atomic_set_bool(&stream->sent_headers, false);
 	os_atomic_set_bool(&stream->stopping, false);
-	replay_buffer_clear(stream);
+	replay_clear(stream);
 }
 
-static void replay_buffer_data_process(struct ffmpeg_muxer *stream, struct encoder_packet *packet);
+static void replay_data_process(struct ffmpeg_muxer *stream, struct encoder_packet *packet);
 
 /* Marks the callback as in flight so ffmpeg_mux_destroy() can wait for it.
  * Returns false when the output is already shutting down. */
-static bool replay_buffer_callback_enter(struct ffmpeg_muxer *stream)
+static bool replay_callback_enter(struct ffmpeg_muxer *stream)
 {
-	if (!stream->replay_buffer_mutex_initialized) {
+	if (!stream->replay_mutex_initialized) {
 		return active(stream);
 	}
 
-	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	pthread_mutex_lock(&stream->replay_mutex);
 	const bool ok = active(stream) && !stream->replay_shutdown;
 	if (ok) {
 		stream->replay_callbacks++;
 	}
-	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	pthread_mutex_unlock(&stream->replay_mutex);
 	return ok;
 }
 
-static void replay_buffer_callback_leave(struct ffmpeg_muxer *stream)
+static void replay_callback_leave(struct ffmpeg_muxer *stream)
 {
-	if (!stream->replay_buffer_mutex_initialized) {
+	if (!stream->replay_mutex_initialized) {
 		return;
 	}
 
-	pthread_mutex_lock(&stream->replay_buffer_mutex);
+	pthread_mutex_lock(&stream->replay_mutex);
 	stream->replay_callbacks--;
 	if (stream->replay_cond_initialized) {
 		pthread_cond_signal(&stream->replay_cond);
 	}
-	pthread_mutex_unlock(&stream->replay_buffer_mutex);
+	pthread_mutex_unlock(&stream->replay_mutex);
 }
 
-static void replay_buffer_data(void *data, struct encoder_packet *packet)
+static void replay_data(void *data, struct encoder_packet *packet)
 {
 	struct ffmpeg_muxer *stream = data;
 
@@ -1701,16 +1697,16 @@ static void replay_buffer_data(void *data, struct encoder_packet *packet)
 		return;
 	}
 
-	if (!replay_buffer_callback_enter(stream)) {
+	if (!replay_callback_enter(stream)) {
 		return;
 	}
 
-	replay_buffer_data_process(stream, packet);
+	replay_data_process(stream, packet);
 
-	replay_buffer_callback_leave(stream);
+	replay_callback_leave(stream);
 }
 
-static void replay_buffer_data_process(struct ffmpeg_muxer *stream, struct encoder_packet *packet)
+static void replay_data_process(struct ffmpeg_muxer *stream, struct encoder_packet *packet)
 {
 
 	/* encoder failure */
@@ -1736,13 +1732,13 @@ static void replay_buffer_data_process(struct ffmpeg_muxer *stream, struct encod
 		/* A selection export may have started between the check above and
 		 * here; keep save_ts so the save is retried on the next packet
 		 * instead of blocking the output thread. */
-		if (replay_buffer_save(stream)) {
+		if (replay_save(stream)) {
 			stream->save_ts = 0;
 		}
 	}
 }
 
-static void replay_buffer_defaults(obs_data_t *s)
+static void replay_defaults(obs_data_t *s)
 {
 	obs_data_set_default_int(s, "max_time_sec", 15);
 	obs_data_set_default_int(s, "max_size_mb", 500);
@@ -1754,12 +1750,12 @@ static void replay_buffer_defaults(obs_data_t *s)
 struct obs_output_info replay_buffer = {
 	.id = "replay_buffer",
 	.flags = OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED | OBS_OUTPUT_MULTI_TRACK | OBS_OUTPUT_CAN_PAUSE,
-	.get_name = replay_buffer_getname,
-	.create = replay_buffer_create,
-	.destroy = replay_buffer_destroy,
-	.start = replay_buffer_start,
+	.get_name = replay_getname,
+	.create = replay_create,
+	.destroy = replay_destroy,
+	.start = replay_start,
 	.stop = ffmpeg_mux_stop,
-	.encoded_packet = replay_buffer_data,
+	.encoded_packet = replay_data,
 	.get_total_bytes = ffmpeg_mux_total_bytes,
-	.get_defaults = replay_buffer_defaults,
+	.get_defaults = replay_defaults,
 };
