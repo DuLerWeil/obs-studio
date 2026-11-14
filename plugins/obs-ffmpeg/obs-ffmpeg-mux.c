@@ -95,6 +95,8 @@ static void ffmpeg_mux_destroy(void *data)
 	 * cache after it was freed, which is where the buffer crashed on stop. */
 	if (stream->replay_buffer_mutex_initialized) {
 		pthread_mutex_lock(&stream->replay_buffer_mutex);
+		blog(LOG_INFO, "[replay buffer] destroy: cache %p, callbacks %d", (void *)stream->replay_cache,
+		     stream->replay_callbacks);
 		os_atomic_set_bool(&stream->active, false);
 		os_atomic_set_bool(&stream->stopping, false);
 		stream->replay_shutdown = true;

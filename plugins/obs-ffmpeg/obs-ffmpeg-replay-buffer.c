@@ -110,35 +110,6 @@ static void cache_release_slot(replay_buffer_cache_t *cache, struct replay_buffe
 	obs_encoder_packet_release(&slot->packet);
 }
 
-/* Deep-copies a packet into a reference-counted block laid out the way
- * obs_encoder_packet_release() expects (the count sits right before the data).
- * Copies keep the ring the only owner of what it stores; taking a reference to
- * the encoder's packet instead shares that count with libobs and the encoder,
- * and when it goes stale the buffer is freed under the ring. */
-static bool cache_copy_packet(struct encoder_packet *dst, const struct encoder_packet *src)
-{
-	long *refs;
-
-	*dst = *src;
-
-	if (!src->data || !src->size) {
-		dst->data = NULL;
-		dst->size = 0;
-		return true;
-	}
-
-	refs = bmalloc(src->size + sizeof(long));
-	if (!refs) {
-		memset(dst, 0, sizeof(*dst));
-		return false;
-	}
-
-	dst->data = (uint8_t *)(refs + 1);
-	*refs = 1;
-	memcpy(dst->data, src->data, src->size);
-	return true;
-}
-
 static bool cache_reserve_slots(replay_buffer_cache_t *cache, size_t needed)
 {
 	if (needed <= cache->capacity)
@@ -312,12 +283,9 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		cache_release_slot(cache, slot, cache->count);
 	}
 
-	/* Copy before touching the GOP bookkeeping, so a failed allocation cannot
-	 * leave a GOP that claims a packet the ring does not hold. */
-	if (!cache_copy_packet(&slot->packet, packet)) {
-		pthread_mutex_unlock(&cache->mutex);
-		return;
-	}
+	/* Reference the packet: the payload is already reference counted and the
+	 * ring keeps it alive exactly as long as it holds the slot. */
+	obs_encoder_packet_ref(&slot->packet, packet);
 
 	if (starts_gop) {
 		struct replay_buffer_gop gop = {0};
