@@ -28,3 +28,16 @@ target_include_directories(test_os_path PRIVATE ${CMOCKA_INCLUDE_DIR})
 target_link_libraries(test_os_path PRIVATE OBS::libobs ${CMOCKA_LIBRARIES})
 
 add_test(test_os_path ${CMAKE_CURRENT_BINARY_DIR}/test_os_path)
+
+# Replay buffer cache test
+add_executable(test_replay_buffer_cache test_replay_buffer_cache.c ../../plugins/obs-ffmpeg/obs-ffmpeg-replay-buffer.c)
+target_include_directories(
+  test_replay_buffer_cache
+  PRIVATE ${CMOCKA_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/plugins/obs-ffmpeg
+)
+target_link_libraries(
+  test_replay_buffer_cache
+  PRIVATE OBS::libobs ${CMOCKA_LIBRARIES} $<$<PLATFORM_ID:Windows>:OBS::w32-pthreads>
+)
+
+add_test(test_replay_buffer_cache ${CMAKE_CURRENT_BINARY_DIR}/test_replay_buffer_cache)
