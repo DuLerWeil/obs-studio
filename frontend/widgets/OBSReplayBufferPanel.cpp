@@ -192,7 +192,6 @@ OBSReplayBufferTimeline::OBSReplayBufferTimeline(QWidget *parent) : QWidget(pare
 	setCursor(Qt::PointingHandCursor);
 	setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 	setMinimumHeight(PreferredHeight());
-	setToolTip(QTStr("Basic.Main.Preview.ReplayBuffer.TimelineHint"));
 }
 
 void OBSReplayBufferTimeline::changeEvent(QEvent *event)
@@ -1036,28 +1035,24 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	 * preview's own controls. */
 	const int navIconSize = qMax(10, iconSize - 4);
 
-	auto makeButton = [this](const QIcon &icon, const QString &tooltip, int size) {
+	auto makeButton = [this](const QIcon &icon, int size) {
 		QToolButton *button = new QToolButton(this);
 		button->setAutoRaise(true);
 		button->setFocusPolicy(Qt::NoFocus);
 		button->setIconSize(QSize(size, size));
 		button->setIcon(icon);
-		button->setToolTip(tooltip);
 		return button;
 	};
 
 	/* One icon family for the whole strip: the theme's own media glyphs, so the
 	 * steps, the saves and "go live" share stroke weight and corner rounding
 	 * instead of mixing Qt's filled pixmaps with outline SVGs. */
-	prevButton_ = makeButton(ThemeIcon("media/media_previous.svg"),
-				 QTStr("Basic.Main.Preview.ReplayBuffer.PreviousKeyframe"), navIconSize);
-	nextButton_ = makeButton(ThemeIcon("media/media_next.svg"),
-				 QTStr("Basic.Main.Preview.ReplayBuffer.NextKeyframe"), navIconSize);
+	prevButton_ = makeButton(ThemeIcon("media/media_previous.svg"), navIconSize);
+	nextButton_ = makeButton(ThemeIcon("media/media_next.svg"), navIconSize);
 
 	/* Two states: pause the live view where it is, or jump back to the newest
-	 * frame; UpdateGoLiveState() picks the glyph and the tooltip. */
-	goLiveButton_ = makeButton(ThemeIcon("media/media_pause.svg"),
-				   QTStr("Basic.Main.Preview.ReplayBuffer.PauseLive"), navIconSize);
+	 * frame; UpdateGoLiveState() picks the glyph. */
+	goLiveButton_ = makeButton(ThemeIcon("media/media_pause.svg"), navIconSize);
 
 	/* Two explicit buttons replace the old options menu: exporting the whole
 	 * buffer and exporting the marked clip. Their icons share the save arrow and
@@ -1068,8 +1063,6 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	exportAction_ = new QAction(QTStr("Basic.Main.Preview.ReplayBuffer.ExportSelection"), this);
 	exportAction_->setEnabled(false);
 	exportAction_->setIcon(ThemeIcon("replay-save-selection.svg"));
-	/* Icon-only, so the action text doubles as the tooltip. */
-	exportAction_->setToolTip(exportAction_->text());
 	connect(exportAction_, &QAction::triggered, this, &OBSReplayBufferPanel::ExportSelection);
 
 	exportButton_ = new QToolButton(this);
@@ -1542,8 +1535,6 @@ void OBSReplayBufferPanel::UpdateCompactness()
 
 void OBSReplayBufferPanel::UpdateCollapsedState()
 {
-	collapseButton_->setToolTip(QTStr(collapsed_ ? "Basic.Main.Preview.ReplayBuffer.Expand"
-						     : "Basic.Main.Preview.ReplayBuffer.Collapse"));
 	ApplyCollapseIcon();
 
 	timeline_->setVisible(!collapsed_);
@@ -1786,8 +1777,6 @@ void OBSReplayBufferPanel::UpdateGoLiveState()
 
 	goLiveButton_->setEnabled(usable);
 	goLiveButton_->setIcon(ThemeIcon(parked ? "media/media_play.svg" : "media/media_pause.svg"));
-	goLiveButton_->setToolTip(QTStr(parked ? "Basic.Main.Preview.ReplayBuffer.GoLiveHint"
-					       : "Basic.Main.Preview.ReplayBuffer.PauseLive"));
 }
 
 void OBSReplayBufferPanel::ToggleLivePause()
