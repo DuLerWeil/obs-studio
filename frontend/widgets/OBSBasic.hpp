@@ -58,6 +58,7 @@ class OBSBasicTransform;
 class OBSLogViewer;
 class OBSMissingFiles;
 class OBSProjector;
+class OBSReplayBufferPanel;
 class ScreenshotObj;
 class VolumeControl;
 #ifdef YOUTUBE_ENABLED
@@ -1048,6 +1049,11 @@ signals:
 private:
 	bool replayBufferStopping = false;
 	std::string lastReplay;
+	QPointer<OBSReplayBufferPanel> replayBufferPanel;
+
+public:
+	/* Returns a new reference; the caller releases it. */
+	obs_output_t *GetReplayBufferOutput();
 
 public slots:
 	void ShowReplayBufferPauseWarning();
