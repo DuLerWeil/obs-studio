@@ -1,5 +1,7 @@
 #pragma once
 
+#include "obs-ffmpeg-replay-buffer-frame-decoder.h"
+
 #include <obs-module.h>
 #include <obs-hotkey.h>
 #include <util/deque.h>
@@ -33,7 +35,26 @@ struct ffmpeg_muxer {
 
 	/* replay buffer */
 	int64_t save_ts;
-	int keyframes;
+	replay_buffer_cache_t *replay_cache;
+	replay_buffer_frame_decoder_t *frame_decoder;
+	pthread_mutex_t replay_buffer_mutex;
+	bool replay_buffer_mutex_initialized;
+	/* The GPU encode thread may still hand us a packet while the output is being
+	 * destroyed; destroy sets replay_shutdown and waits for replay_callbacks to
+	 * reach zero before it frees anything the callback touches. */
+	volatile bool replay_shutdown;
+	int replay_callbacks;
+	pthread_cond_t replay_cond;
+	bool replay_cond_initialized;
+	pthread_mutex_t save_mutex;
+	bool save_mutex_initialized;
+	bool selection_export;
+	/* Set while the replay save/export mux thread owns stream->pipe, so a
+	 * failed helper write only fails that file instead of the live output. */
+	bool replay_mux;
+	volatile long export_state;
+	volatile long export_error;
+	struct dstr selection_path;
 	obs_hotkey_id hotkey;
 	volatile bool muxing;
 	mux_packets_t mux_packets;
