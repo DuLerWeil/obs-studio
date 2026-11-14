@@ -2,9 +2,7 @@
 
 #include "obs-ffmpeg-replay-buffer.h"
 
-#define REPLAY_BUFFER_FRAME_PENDING 0
-#define REPLAY_BUFFER_FRAME_READY 1
-#define REPLAY_BUFFER_FRAME_FAILED 2
+#include <obs-replay-buffer-interface.h>
 
 typedef struct replay_buffer_frame_decoder replay_buffer_frame_decoder_t;
 

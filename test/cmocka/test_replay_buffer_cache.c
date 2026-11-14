@@ -29,13 +29,14 @@ static void packet_init(struct encoder_packet *packet, enum obs_encoder_type typ
 	}
 }
 
-static void push_packet(replay_buffer_cache_t *cache, enum obs_encoder_type type, bool keyframe, int64_t dts_usec,
+static bool push_packet(replay_buffer_cache_t *cache, enum obs_encoder_type type, bool keyframe, int64_t dts_usec,
 			size_t size, bool allocate_data)
 {
 	struct encoder_packet packet;
 	packet_init(&packet, type, keyframe, dts_usec, size, 0, allocate_data);
-	replay_buffer_cache_push(cache, &packet);
+	const bool stored = replay_buffer_cache_push(cache, &packet);
 	obs_encoder_packet_release(&packet);
+	return stored;
 }
 
 static void test_push_index_and_range(void **state)
@@ -62,12 +63,12 @@ static void test_push_index_and_range(void **state)
 
 	struct replay_buffer_keyframe_info info = {0};
 	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &info));
-	assert_int_equal(info.index, 0);
+	assert_int_equal(info.packet_index, 0);
 	assert_int_equal(info.dts_usec, 0);
 	assert_int_equal(info.duration_usec, 1000000);
 
 	assert_true(replay_buffer_cache_get_keyframe_info(cache, 1, &info));
-	assert_int_equal(info.index, 3);
+	assert_int_equal(info.packet_index, 3);
 	assert_int_equal(info.dts_usec, 1000000);
 	assert_int_equal(info.duration_usec, 100000);
 
@@ -359,6 +360,150 @@ static void test_range_boundaries_and_clamping(void **state)
 	replay_buffer_cache_destroy(cache);
 }
 
+static void test_info_is_consistent(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 4000000, 30000000);
+
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, 1000000, 100, false));
+	assert_true(push_packet(cache, OBS_ENCODER_AUDIO, false, 1100000, 10, false));
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, false, 1200000, 20, false));
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, 2000000, 200, false));
+
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.start_usec, 1000000);
+	assert_int_equal(info.end_usec, 2000000);
+	assert_int_equal(info.max_size_bytes, 4000000);
+	assert_int_equal(info.max_time_usec, 30000000);
+	assert_int_equal(info.bytes, 330);
+	assert_int_equal(info.keyframe_count, 2);
+	assert_int_equal(info.packet_count, 4);
+	assert_int_equal(info.dropped_packets, 0);
+	assert_int_equal(info.dropped_keyframes, 0);
+	assert_int_equal(info.push_failures, 0);
+
+	struct replay_buffer_keyframe_info frame = {0};
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 0, &frame));
+	assert_int_equal(frame.packet_index, 0);
+	assert_int_equal(frame.dts_usec, 1000000);
+	assert_int_equal(frame.duration_usec, 1000000);
+
+	assert_true(replay_buffer_cache_get_keyframe_info(cache, 1, &frame));
+	assert_int_equal(frame.packet_index, 3);
+	assert_int_equal(frame.dts_usec, 2000000);
+	assert_int_equal(frame.duration_usec, 0);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+static void test_push_reports_dropped_packets(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, 60000000);
+
+	/* Audio and non-keyframe video before the first keyframe have no GOP to
+	 * belong to; push reports that instead of silently accepting them. */
+	assert_false(push_packet(cache, OBS_ENCODER_AUDIO, false, 0, 10, false));
+	assert_false(push_packet(cache, OBS_ENCODER_VIDEO, false, 100000, 20, false));
+
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.packet_count, 0);
+	assert_int_equal(info.keyframe_count, 0);
+	assert_int_equal(info.dropped_packets, 2);
+	assert_int_equal(info.dropped_bytes, 30);
+	assert_int_equal(info.dropped_keyframes, 0);
+	assert_int_equal(info.push_failures, 0);
+
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, 200000, 100, false));
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, false, 300000, 50, false));
+
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.packet_count, 2);
+	assert_int_equal(info.keyframe_count, 1);
+	assert_int_equal(info.dropped_packets, 2);
+
+	/* clear() starts a new session: counters reset and a packet that is not
+	 * preceded by a keyframe is dropped again. */
+	replay_buffer_cache_clear(cache);
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.packet_count, 0);
+	assert_int_equal(info.keyframe_count, 0);
+	assert_int_equal(info.dropped_packets, 0);
+
+	assert_false(push_packet(cache, OBS_ENCODER_VIDEO, false, 400000, 50, false));
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.dropped_packets, 1);
+	assert_int_equal(info.dropped_bytes, 50);
+
+	replay_buffer_cache_destroy(cache);
+}
+
+static void test_block_growth_and_eviction(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	enum { kPackets = 3000, kGop = 100, kSize = 100 };
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	/* No limits: the block table has to grow past the first block. */
+	replay_buffer_cache_set_limits(cache, 0, 0);
+
+	for (int i = 0; i < kPackets; i++)
+		assert_true(push_packet(cache, OBS_ENCODER_VIDEO, (i % kGop) == 0, (int64_t)i * 1000, kSize, false));
+
+	struct replay_buffer_cache_info info = {0};
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.packet_count, kPackets);
+	assert_int_equal(info.keyframe_count, kPackets / kGop);
+	assert_int_equal(info.bytes, (int64_t)kPackets * kSize);
+
+	struct encoder_packet packet = {0};
+	assert_true(replay_buffer_cache_ref_packet_at(cache, 0, &packet));
+	assert_int_equal(packet.dts_usec, 0);
+	obs_encoder_packet_release(&packet);
+
+	assert_true(replay_buffer_cache_ref_packet_at(cache, kPackets - 1, &packet));
+	assert_int_equal(packet.dts_usec, (int64_t)(kPackets - 1) * 1000);
+	obs_encoder_packet_release(&packet);
+
+	/* Force history to roll past the first two blocks. Two GOPs are retained,
+	 * so the window ends up at 2800..3000 (201 packets) even though that is
+	 * 100 bytes over the configured size: the two-GOP floor wins. */
+	replay_buffer_cache_set_limits(cache, 20000, 0);
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, false, (int64_t)kPackets * 1000, kSize, false));
+
+	replay_buffer_cache_get_info(cache, &info);
+	assert_int_equal(info.keyframe_count, 2);
+	assert_int_equal(info.packet_count, 201);
+	assert_int_equal(info.bytes, 20100);
+	assert_int_equal(info.start_usec, 2800000);
+	assert_int_equal(info.end_usec, 3000000);
+	assert_int_equal(info.dropped_packets, 0);
+
+	/* Indices in the freed blocks no longer resolve; the new head and the
+	 * newest packet do. */
+	assert_false(replay_buffer_cache_ref_packet_at(cache, 0, &packet));
+	assert_false(replay_buffer_cache_ref_packet_at(cache, 1500, &packet));
+	assert_false(replay_buffer_cache_ref_packet_at(cache, 2799, &packet));
+	assert_true(replay_buffer_cache_ref_packet_at(cache, 2800, &packet));
+	assert_int_equal(packet.dts_usec, 2800000);
+	obs_encoder_packet_release(&packet);
+	assert_true(replay_buffer_cache_ref_packet_at(cache, kPackets, &packet));
+	assert_int_equal(packet.dts_usec, (int64_t)kPackets * 1000);
+	obs_encoder_packet_release(&packet);
+
+	replay_buffer_cache_destroy(cache);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -369,6 +514,9 @@ int main(void)
 		cmocka_unit_test(test_zero_time_limit_keeps_history),
 		cmocka_unit_test(test_range_snapshot_snaps_start_and_truncates_end),
 		cmocka_unit_test(test_range_boundaries_and_clamping),
+		cmocka_unit_test(test_info_is_consistent),
+		cmocka_unit_test(test_push_reports_dropped_packets),
+		cmocka_unit_test(test_block_growth_and_eviction),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

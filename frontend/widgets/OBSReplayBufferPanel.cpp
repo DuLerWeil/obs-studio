@@ -3,6 +3,7 @@
 #include "OBSBasic.hpp"
 
 #include <obs-frontend-api.h>
+#include <obs-replay-buffer-interface.h>
 #include <obs.hpp>
 #include <qt-wrappers.hpp>
 
@@ -63,21 +64,6 @@ constexpr int64_t kMinZoomSpan = 2000000;
 constexpr int kRulerTickRed = 91;
 constexpr int kRulerTickGreen = 98;
 constexpr int kRulerTickBlue = 115;
-
-/* Values of the copy_replay_full_frame status output. */
-constexpr int kFullFramePending = 0;
-constexpr int kFullFrameReady = 1;
-constexpr int kFullFrameFailed = 2;
-
-/* Values of get_replay_export_status/export_replay_selection. */
-constexpr int kExportRunning = 1;
-constexpr int kExportDone = 2;
-
-constexpr int kExportErrNone = 0;
-constexpr int kExportErrInvalid = 1;
-constexpr int kExportErrBusy = 2;
-constexpr int kExportErrInactive = 3;
-constexpr int kExportErrWrite = 4;
 
 QString FormatTime(int64_t usec)
 {
@@ -1384,7 +1370,7 @@ void OBSReplayBufferPanel::RefreshInfo()
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	calldata_t cd = {0};
-	proc_handler_call(ph, "get_replay_buffer_info", &cd);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_INFO, &cd);
 
 	const int64_t start = calldata_int(&cd, "start_time_usec");
 	const int64_t end = calldata_int(&cd, "end_time_usec");
@@ -1553,13 +1539,13 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 	 * whether the moment is still inside a GOP at all. */
 	calldata_t query = {0};
 	calldata_set_int(&query, "time_usec", positionUsec_);
-	proc_handler_call(ph, "find_replay_keyframe", &query);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_KEYFRAME, &query);
 
-	const long long index = calldata_int(&query, "index");
+	const long long ordinal = calldata_int(&query, "ordinal");
 	const int64_t dts = calldata_int(&query, "dts_usec");
 	calldata_free(&query);
 
-	if (index < 0) {
+	if (ordinal < 0) {
 		blog(LOG_DEBUG, "[replay buffer] review %.3fs: no keyframe at this position",
 		     (double)positionUsec_ / 1000000.0);
 		/* Nothing decodable at this position; drop the stale frame so the
@@ -1602,7 +1588,7 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", time_usec);
 	calldata_set_int(&cd, "request_id", (long long)requestId);
-	proc_handler_call(ph, "request_replay_full_frame", &cd);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_REQUEST_FULL_FRAME, &cd);
 	const long long accepted = calldata_int(&cd, "accepted");
 	calldata_free(&cd);
 
@@ -1649,7 +1635,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_set_int(&query, "request_id", (long long)pendingFullFrameId_);
 	calldata_set_int(&query, "capacity", 0);
 	calldata_set_ptr(&query, "dst", nullptr);
-	proc_handler_call(ph, "copy_replay_full_frame", &query);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_COPY_FULL_FRAME, &query);
 
 	const int status = (int)calldata_int(&query, "status");
 	const int width = (int)calldata_int(&query, "width");
@@ -1657,7 +1643,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	const long long size = calldata_int(&query, "size");
 	calldata_free(&query);
 
-	if (status == kFullFramePending) {
+	if (status == REPLAY_BUFFER_FRAME_PENDING) {
 		if (fullFrameElapsed_.elapsed() > 3000) {
 			blog(LOG_INFO, "[replay buffer] review: decode timed out");
 			CancelFullFrame();
@@ -1670,7 +1656,7 @@ void OBSReplayBufferPanel::PollFullFrame()
 	fullFrameTimer_.stop();
 	fullFramePending_ = false;
 
-	if (status == kFullFrameFailed || size <= 0 || width <= 0 || height <= 0) {
+	if (status == REPLAY_BUFFER_FRAME_FAILED || size <= 0 || width <= 0 || height <= 0) {
 		return;
 	}
 
@@ -1683,13 +1669,13 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_set_int(&copy, "request_id", (long long)pendingFullFrameId_);
 	calldata_set_int(&copy, "capacity", (long long)image.sizeInBytes());
 	calldata_set_ptr(&copy, "dst", image.bits());
-	proc_handler_call(ph, "copy_replay_full_frame", &copy);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_COPY_FULL_FRAME, &copy);
 
 	const int copyStatus = (int)calldata_int(&copy, "status");
 	const long long copied = calldata_int(&copy, "size");
 	calldata_free(&copy);
 
-	if (copyStatus != kFullFrameReady || copied <= 0) {
+	if (copyStatus != REPLAY_BUFFER_FRAME_READY || copied <= 0) {
 		blog(LOG_INFO, "[replay buffer] review: copy returned status %d (%lld bytes)", copyStatus, copied);
 		return;
 	}
@@ -1735,12 +1721,12 @@ void OBSReplayBufferPanel::PreviousKeyframe()
 
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", positionUsec_);
-	proc_handler_call(ph, "find_prev_replay_keyframe", &cd);
-	const int index = (int)calldata_int(&cd, "index");
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_PREV_KEYFRAME, &cd);
+	const int ordinal = (int)calldata_int(&cd, "ordinal");
 	const int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
 
-	if (index < 0) {
+	if (ordinal < 0) {
 		return;
 	}
 
@@ -1762,12 +1748,12 @@ void OBSReplayBufferPanel::NextKeyframe()
 
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "time_usec", positionUsec_);
-	proc_handler_call(ph, "find_next_replay_keyframe", &cd);
-	const int index = (int)calldata_int(&cd, "index");
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_FIND_NEXT_KEYFRAME, &cd);
+	const int ordinal = (int)calldata_int(&cd, "ordinal");
 	const int64_t dts = calldata_int(&cd, "dts_usec");
 	calldata_free(&cd);
 
-	if (index < 0) {
+	if (ordinal < 0) {
 		return;
 	}
 
@@ -1805,7 +1791,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	 * the window that is actually buffered and let the cache snap the start to a
 	 * keyframe; the values it settles on come back below. */
 	if (!timeline_->HasSelection()) {
-		ShowExportError(kExportErrInvalid);
+		ShowExportError(REPLAY_BUFFER_EXPORT_ERR_INVALID);
 		return;
 	}
 
@@ -1819,7 +1805,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	     (double)rangeStartUsec_ / 1000000.0, (double)rangeEndUsec_ / 1000000.0);
 
 	if (selectionEnd <= selectionStart) {
-		ShowExportError(kExportErrInvalid);
+		ShowExportError(REPLAY_BUFFER_EXPORT_ERR_INVALID);
 		return;
 	}
 
@@ -1833,7 +1819,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	calldata_t cd = {0};
 	calldata_set_int(&cd, "start_usec", selectionStart);
 	calldata_set_int(&cd, "end_usec", selectionEnd);
-	proc_handler_call(ph, "export_replay_selection", &cd);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_EXPORT_SELECTION, &cd);
 
 	const int result = (int)calldata_int(&cd, "result");
 	const int64_t actualStart = calldata_int(&cd, "actual_start_usec");
@@ -1843,7 +1829,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	blog(LOG_INFO, "[replay buffer] export result %d (%.3fs - %.3fs)", result, (double)actualStart / 1000000.0,
 	     (double)actualEnd / 1000000.0);
 
-	if (result != kExportErrNone) {
+	if (result != REPLAY_BUFFER_EXPORT_ERR_NONE) {
 		ShowExportError(result);
 		return;
 	}
@@ -1882,12 +1868,12 @@ void OBSReplayBufferPanel::PollExport()
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 
 	calldata_t cd = {0};
-	proc_handler_call(ph, "get_replay_export_status", &cd);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_EXPORT_STATUS, &cd);
 	const int state = (int)calldata_int(&cd, "state");
 	const int error = (int)calldata_int(&cd, "error");
 	calldata_free(&cd);
 
-	if (state == kExportRunning) {
+	if (state == REPLAY_BUFFER_EXPORT_RUNNING) {
 		return;
 	}
 
@@ -1896,13 +1882,13 @@ void OBSReplayBufferPanel::PollExport()
 	UpdateControls();
 	UpdateLabels();
 
-	if (state != kExportDone) {
+	if (state != REPLAY_BUFFER_EXPORT_DONE) {
 		ShowExportError(error);
 		return;
 	}
 
 	calldata_t pathCd = {0};
-	proc_handler_call(ph, "get_last_replay", &pathCd);
+	proc_handler_call(ph, REPLAY_BUFFER_PROC_GET_LAST_REPLAY, &pathCd);
 	const char *lastPath = calldata_string(&pathCd, "path");
 	const std::string path = lastPath ? lastPath : "";
 	calldata_free(&pathCd);
@@ -1916,16 +1902,16 @@ void OBSReplayBufferPanel::ShowExportError(int error)
 	QString message;
 
 	switch (error) {
-	case kExportErrInvalid:
+	case REPLAY_BUFFER_EXPORT_ERR_INVALID:
 		message = QTStr("Basic.Main.Preview.ReplayBuffer.ExportInvalid");
 		break;
-	case kExportErrBusy:
+	case REPLAY_BUFFER_EXPORT_ERR_BUSY:
 		message = QTStr("Basic.Main.Preview.ReplayBuffer.ExportBusy");
 		break;
-	case kExportErrInactive:
+	case REPLAY_BUFFER_EXPORT_ERR_INACTIVE:
 		message = QTStr("Basic.Main.Preview.ReplayBuffer.NotRunning");
 		break;
-	case kExportErrWrite:
+	case REPLAY_BUFFER_EXPORT_ERR_WRITE:
 	default:
 		message = QTStr("Basic.Main.Preview.ReplayBuffer.ExportWriteFailed");
 		break;

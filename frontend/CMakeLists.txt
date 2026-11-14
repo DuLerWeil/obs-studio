@@ -28,6 +28,10 @@ if(NOT TARGET OBS::qt-obs-spinbox)
   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/qt/obs-spinbox" obs-spinbox)
 endif()
 
+if(NOT TARGET OBS::replay-buffer-interface)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/replay-buffer-interface" replay-buffer-interface)
+endif()
+
 add_executable(obs-studio)
 add_executable(OBS::studio ALIAS obs-studio)
 
@@ -42,6 +46,7 @@ target_link_libraries(
     OBS::frontend-api
     OBS::json11
     OBS::bpm
+    OBS::replay-buffer-interface
     OBS::qt-obs-spinbox
 )
 

@@ -66,6 +66,17 @@ struct replay_buffer_cache {
 	int64_t max_time_usec;
 
 	size_t video_track_idx;
+
+	/* Set until the first video keyframe is stored and again after an
+	 * insertion failure: while set, only a video keyframe can start a new
+	 * GOP, so a partially written GOP is never exposed to readers. */
+	bool need_keyframe;
+
+	/* Packets that were not stored, for diagnostics and the UI. */
+	uint64_t dropped_packets;
+	uint64_t dropped_bytes;
+	uint64_t dropped_keyframes;
+	uint64_t push_failures;
 };
 
 struct replay_buffer_snapshot {
@@ -82,9 +93,9 @@ static size_t cache_gop_count(const replay_buffer_cache_t *cache)
 	return cache->gops.num - cache->gops_head;
 }
 
-static struct replay_buffer_gop *cache_gop_at(const replay_buffer_cache_t *cache, size_t index)
+static struct replay_buffer_gop *cache_gop_at(const replay_buffer_cache_t *cache, size_t ordinal)
 {
-	return &cache->gops.array[cache->gops_head + index];
+	return &cache->gops.array[cache->gops_head + ordinal];
 }
 
 static uint64_t cache_block_of(uint64_t index)
@@ -265,6 +276,7 @@ replay_buffer_cache_t *replay_buffer_cache_create(size_t video_track_idx)
 	}
 
 	cache->video_track_idx = video_track_idx;
+	cache->need_keyframe = true;
 	return cache;
 }
 
@@ -309,31 +321,67 @@ void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 	cache->first_dts_usec = 0;
 	cache->last_dts_usec = 0;
 	cache->total_size = 0;
+	cache->need_keyframe = true;
+	cache->dropped_packets = 0;
+	cache->dropped_bytes = 0;
+	cache->dropped_keyframes = 0;
+	cache->push_failures = 0;
 	cache_release_blocks(cache);
 
 	pthread_mutex_unlock(&cache->mutex);
 }
 
-void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packet *packet)
+static void cache_note_drop(replay_buffer_cache_t *cache, const struct encoder_packet *packet, bool keyframe,
+			    bool failure)
 {
-	if (!cache || !packet)
+	cache->dropped_packets++;
+	cache->dropped_bytes += (uint64_t)packet->size;
+	if (keyframe)
+		cache->dropped_keyframes++;
+
+	if (!failure)
 		return;
 
-	const bool starts_gop = packet->type == OBS_ENCODER_VIDEO && packet->keyframe &&
-				packet->track_idx == cache->video_track_idx;
+	cache->push_failures++;
+	/* Report the first failure and then one per 1024, so a broken allocator
+	 * cannot flood the log while still leaving a trace. */
+	if (cache->push_failures == 1 || (cache->push_failures % 1024) == 0) {
+		blog(LOG_WARNING,
+		     "[replay buffer] failed to store %s packet (%llu bytes, next index %llu), %llu failure(s)",
+		     keyframe ? "keyframe" : "packet", (unsigned long long)packet->size,
+		     (unsigned long long)cache->next_index, (unsigned long long)cache->push_failures);
+	}
+}
+
+bool replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packet *packet)
+{
+	if (!cache || !packet)
+		return false;
+
+	const bool video = packet->type == OBS_ENCODER_VIDEO;
+	const bool starts_gop = video && packet->keyframe && packet->track_idx == cache->video_track_idx;
 
 	pthread_mutex_lock(&cache->mutex);
 
 	/* Packets before the first video keyframe have no GOP to belong to and can
-	 * never be exported, because every export starts on a keyframe. */
-	if (!cache_gop_count(cache) && !starts_gop) {
+	 * never be exported, because every export starts on a keyframe. The same
+	 * applies after an insertion failure until the next keyframe: the current
+	 * GOP may be incomplete, so it must not be exposed. */
+	if (cache->need_keyframe && !starts_gop) {
+		cache_note_drop(cache, packet, false, false);
 		pthread_mutex_unlock(&cache->mutex);
-		return;
+		return false;
 	}
 
 	if (!cache_ensure_packet(cache, cache->next_index)) {
+		/* A video gap makes the current GOP undecodable, so wait for the next
+		 * keyframe. A dropped audio packet only leaves a hole in the audio
+		 * track and the video GOP stays usable. */
+		if (video)
+			cache->need_keyframe = true;
+		cache_note_drop(cache, packet, starts_gop, true);
 		pthread_mutex_unlock(&cache->mutex);
-		return;
+		return false;
 	}
 
 	struct replay_buffer_packet *slot = cache_slot_at(cache, cache->next_index);
@@ -356,12 +404,16 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		if (!da_push_back(cache->gops, &gop)) {
 			obs_encoder_packet_release(&slot->packet);
 			slot->magic = 0;
+			cache->need_keyframe = true;
+			cache_note_drop(cache, packet, true, true);
 			pthread_mutex_unlock(&cache->mutex);
-			return;
+			return false;
 		}
 	}
 
 	cache->next_index++;
+	if (starts_gop)
+		cache->need_keyframe = false;
 
 	if (cache_packet_count(cache) == 1) {
 		cache->first_dts_usec = packet->dts_usec;
@@ -372,6 +424,33 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 
 	cache->total_size += (int64_t)packet->size;
 	cache_trim(cache);
+
+	pthread_mutex_unlock(&cache->mutex);
+	return true;
+}
+
+void replay_buffer_cache_get_info(replay_buffer_cache_t *cache, struct replay_buffer_cache_info *info)
+{
+	if (!info)
+		return;
+
+	memset(info, 0, sizeof(*info));
+	if (!cache)
+		return;
+
+	pthread_mutex_lock(&cache->mutex);
+
+	info->start_usec = cache->first_dts_usec;
+	info->end_usec = cache->last_dts_usec;
+	info->max_size_bytes = cache->max_size_bytes;
+	info->max_time_usec = cache->max_time_usec;
+	info->bytes = cache->total_size;
+	info->keyframe_count = cache_gop_count(cache);
+	info->packet_count = cache_packet_count(cache);
+	info->dropped_packets = cache->dropped_packets;
+	info->dropped_bytes = cache->dropped_bytes;
+	info->dropped_keyframes = cache->dropped_keyframes;
+	info->push_failures = cache->push_failures;
 
 	pthread_mutex_unlock(&cache->mutex);
 }
@@ -401,7 +480,7 @@ size_t replay_buffer_cache_get_keyframe_count(replay_buffer_cache_t *cache)
 	return count;
 }
 
-bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t index,
+bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t ordinal,
 					   struct replay_buffer_keyframe_info *info)
 {
 	if (!cache || !info)
@@ -413,10 +492,15 @@ bool replay_buffer_cache_get_keyframe_info(replay_buffer_cache_t *cache, size_t 
 	pthread_mutex_lock(&cache->mutex);
 
 	const size_t count = cache_gop_count(cache);
-	if (index < count) {
-		const struct replay_buffer_gop *gop = cache_gop_at(cache, index);
-		info->index = gop->first_index;
+	if (ordinal < count) {
+		const struct replay_buffer_gop *gop = cache_gop_at(cache, ordinal);
+		int64_t end_usec = cache->last_dts_usec;
+		if (ordinal + 1 < count)
+			end_usec = cache_gop_at(cache, ordinal + 1)->start_dts_usec;
+
+		info->packet_index = gop->first_index;
 		info->dts_usec = gop->start_dts_usec;
+		info->duration_usec = end_usec > gop->start_dts_usec ? end_usec - gop->start_dts_usec : 0;
 		found = true;
 	}
 
@@ -460,16 +544,16 @@ static size_t cache_nearest_gop(const replay_buffer_cache_t *cache, int64_t time
 	return before <= after ? low - 1 : low;
 }
 
-bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
+bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *ordinal)
 {
-	if (!cache || !index)
+	if (!cache || !ordinal)
 		return false;
 
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
 	if (cache_gop_count(cache) > 0) {
-		*index = cache_nearest_gop(cache, time_usec) - cache->gops_head;
+		*ordinal = cache_nearest_gop(cache, time_usec) - cache->gops_head;
 		found = true;
 	}
 
@@ -477,9 +561,9 @@ bool replay_buffer_cache_find_keyframe(replay_buffer_cache_t *cache, int64_t tim
 	return found;
 }
 
-bool replay_buffer_cache_find_prev_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
+bool replay_buffer_cache_find_prev_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *ordinal)
 {
-	if (!cache || !index)
+	if (!cache || !ordinal)
 		return false;
 
 	bool found = false;
@@ -487,7 +571,7 @@ bool replay_buffer_cache_find_prev_keyframe(replay_buffer_cache_t *cache, int64_
 
 	const size_t low = cache_gop_lower_bound(cache, time_usec, false);
 	if (low > cache->gops_head) {
-		*index = low - 1 - cache->gops_head;
+		*ordinal = low - 1 - cache->gops_head;
 		found = true;
 	}
 
@@ -495,9 +579,9 @@ bool replay_buffer_cache_find_prev_keyframe(replay_buffer_cache_t *cache, int64_
 	return found;
 }
 
-bool replay_buffer_cache_find_next_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *index)
+bool replay_buffer_cache_find_next_keyframe(replay_buffer_cache_t *cache, int64_t time_usec, size_t *ordinal)
 {
-	if (!cache || !index)
+	if (!cache || !ordinal)
 		return false;
 
 	bool found = false;
@@ -505,7 +589,7 @@ bool replay_buffer_cache_find_next_keyframe(replay_buffer_cache_t *cache, int64_
 
 	const size_t low = cache_gop_lower_bound(cache, time_usec, true);
 	if (low < cache->gops.num) {
-		*index = low - cache->gops_head;
+		*ordinal = low - cache->gops_head;
 		found = true;
 	}
 
@@ -653,10 +737,10 @@ bool replay_buffer_cache_ref_first_keyframe(replay_buffer_cache_t *cache, struct
 	return found;
 }
 
-bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t time_usec, uint64_t *index,
+bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t time_usec, uint64_t *packet_index,
 					 struct encoder_packet *packet)
 {
-	if (!cache || !index || !packet)
+	if (!cache || !packet_index || !packet)
 		return false;
 
 	bool found = false;
@@ -668,7 +752,7 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 
 		if (slot && slot->packet.type == OBS_ENCODER_VIDEO && slot->packet.keyframe) {
 			obs_encoder_packet_ref(packet, &slot->packet);
-			*index = slot->index;
+			*packet_index = slot->index;
 			found = true;
 		}
 	}
@@ -677,13 +761,15 @@ bool replay_buffer_cache_ref_keyframe_at(replay_buffer_cache_t *cache, int64_t t
 
 	if (found) {
 		blog(LOG_DEBUG, "[replay buffer] keyframe at index %llu (dts %.3fs, requested %.3fs)",
-		     (unsigned long long)*index, (double)packet->dts_usec / 1000000.0, (double)time_usec / 1000000.0);
+		     (unsigned long long)*packet_index, (double)packet->dts_usec / 1000000.0,
+		     (double)time_usec / 1000000.0);
 	}
 
 	return found;
 }
 
-bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t index, struct encoder_packet *packet)
+bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t packet_index,
+				       struct encoder_packet *packet)
 {
 	if (!cache || !packet)
 		return false;
@@ -691,7 +777,7 @@ bool replay_buffer_cache_ref_packet_at(replay_buffer_cache_t *cache, uint64_t in
 	bool found = false;
 	pthread_mutex_lock(&cache->mutex);
 
-	struct replay_buffer_packet *slot = cache_live_slot(cache, index);
+	struct replay_buffer_packet *slot = cache_live_slot(cache, packet_index);
 	if (slot) {
 		obs_encoder_packet_ref(packet, &slot->packet);
 		found = true;

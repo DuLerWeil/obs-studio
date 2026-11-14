@@ -20,6 +20,8 @@
 #include "obs-ffmpeg-replay-buffer.h"
 #include "obs-ffmpeg-replay-buffer-frame-decoder.h"
 
+#include <obs-replay-buffer-interface.h>
+
 #ifdef _WIN32
 #include "util/windows/win-version.h"
 #endif
@@ -31,20 +33,6 @@
 
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
 #define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
-
-/* Replay selection export state, readable through get_replay_export_status. */
-#define REPLAY_EXPORT_IDLE 0
-#define REPLAY_EXPORT_RUNNING 1
-#define REPLAY_EXPORT_DONE 2
-#define REPLAY_EXPORT_FAILED 3
-
-/* Also used as the result of export_replay_selection: 0 means the export
- * started, any other value is the reason it did not. */
-#define REPLAY_EXPORT_ERR_NONE 0
-#define REPLAY_EXPORT_ERR_INVALID 1
-#define REPLAY_EXPORT_ERR_BUSY 2
-#define REPLAY_EXPORT_ERR_INACTIVE 3
-#define REPLAY_EXPORT_ERR_WRITE 4
 
 static const char *ffmpeg_mux_getname(void *type)
 {
@@ -1008,17 +996,42 @@ static void get_last_replay(void *data, calldata_t *cd)
 static void get_replay_buffer_info(void *data, calldata_t *cd)
 {
 	struct ffmpeg_muxer *stream = data;
-	int64_t start_usec = 0;
-	int64_t end_usec = 0;
+	struct replay_buffer_cache_info info;
 
-	replay_buffer_cache_get_time_range(stream->replay_cache, &start_usec, &end_usec);
+	/* One lock, one snapshot: the timeline must not see a start time from
+	 * before an eviction next to a keyframe count from after it. */
+	replay_buffer_cache_get_info(stream->replay_cache, &info);
 
-	calldata_set_int(cd, "start_time_usec", start_usec);
-	calldata_set_int(cd, "end_time_usec", end_usec);
-	calldata_set_int(cd, "keyframe_count", (long long)replay_buffer_cache_get_keyframe_count(stream->replay_cache));
+	calldata_set_int(cd, "start_time_usec", info.start_usec);
+	calldata_set_int(cd, "end_time_usec", info.end_usec);
+	calldata_set_int(cd, "keyframe_count", (long long)info.keyframe_count);
 	/* The configured length limit, not the length buffered so far, so the UI can
 	 * draw a fixed timeline instead of one that grows while the buffer fills. */
-	calldata_set_int(cd, "max_time_usec", stream->max_time);
+	calldata_set_int(cd, "max_time_usec", info.max_time_usec);
+	calldata_set_int(cd, "packet_count", (long long)info.packet_count);
+	calldata_set_int(cd, "bytes", info.bytes);
+	calldata_set_int(cd, "dropped_packets", (long long)info.dropped_packets);
+	calldata_set_int(cd, "dropped_bytes", (long long)info.dropped_bytes);
+	calldata_set_int(cd, "dropped_keyframes", (long long)info.dropped_keyframes);
+	calldata_set_int(cd, "push_failures", (long long)info.push_failures);
+}
+
+/* Fills the ordinal/dts/duration outputs of the find_* procs, or reports
+ * REPLAY_BUFFER_INVALID_ORDINAL when the cache moved on between the lookup and
+ * the info query. */
+static void set_replay_keyframe_result(calldata_t *cd, bool found, size_t ordinal,
+				       const struct replay_buffer_keyframe_info *frame_info)
+{
+	if (!found) {
+		calldata_set_int(cd, "ordinal", REPLAY_BUFFER_INVALID_ORDINAL);
+		calldata_set_int(cd, "dts_usec", 0);
+		calldata_set_int(cd, "duration_usec", 0);
+		return;
+	}
+
+	calldata_set_int(cd, "ordinal", (long long)ordinal);
+	calldata_set_int(cd, "dts_usec", frame_info->dts_usec);
+	calldata_set_int(cd, "duration_usec", frame_info->duration_usec);
 }
 
 static void find_replay_keyframe(void *data, calldata_t *cd)
@@ -1026,18 +1039,13 @@ static void find_replay_keyframe(void *data, calldata_t *cd)
 	struct ffmpeg_muxer *stream = data;
 	const int64_t time_usec = calldata_int(cd, "time_usec");
 	struct replay_buffer_keyframe_info frame_info = {0};
-	size_t index = 0;
+	size_t ordinal = 0;
 
-	/* The buffer keeps rolling between the two calls, so the index may have
+	/* The buffer keeps rolling between the two calls, so the ordinal may have
 	 * been evicted. Report no keyframe instead of a zero timestamp. */
-	if (replay_buffer_cache_find_keyframe(stream->replay_cache, time_usec, &index) &&
-	    replay_buffer_cache_get_keyframe_info(stream->replay_cache, index, &frame_info)) {
-		calldata_set_int(cd, "index", (long long)index);
-		calldata_set_int(cd, "dts_usec", frame_info.dts_usec);
-	} else {
-		calldata_set_int(cd, "index", -1);
-		calldata_set_int(cd, "dts_usec", 0);
-	}
+	const bool found = replay_buffer_cache_find_keyframe(stream->replay_cache, time_usec, &ordinal) &&
+			   replay_buffer_cache_get_keyframe_info(stream->replay_cache, ordinal, &frame_info);
+	set_replay_keyframe_result(cd, found, ordinal, &frame_info);
 }
 
 static void find_prev_replay_keyframe(void *data, calldata_t *cd)
@@ -1045,16 +1053,11 @@ static void find_prev_replay_keyframe(void *data, calldata_t *cd)
 	struct ffmpeg_muxer *stream = data;
 	const int64_t time_usec = calldata_int(cd, "time_usec");
 	struct replay_buffer_keyframe_info frame_info = {0};
-	size_t index = 0;
+	size_t ordinal = 0;
 
-	if (replay_buffer_cache_find_prev_keyframe(stream->replay_cache, time_usec, &index) &&
-	    replay_buffer_cache_get_keyframe_info(stream->replay_cache, index, &frame_info)) {
-		calldata_set_int(cd, "index", (long long)index);
-		calldata_set_int(cd, "dts_usec", frame_info.dts_usec);
-	} else {
-		calldata_set_int(cd, "index", -1);
-		calldata_set_int(cd, "dts_usec", 0);
-	}
+	const bool found = replay_buffer_cache_find_prev_keyframe(stream->replay_cache, time_usec, &ordinal) &&
+			   replay_buffer_cache_get_keyframe_info(stream->replay_cache, ordinal, &frame_info);
+	set_replay_keyframe_result(cd, found, ordinal, &frame_info);
 }
 
 static void find_next_replay_keyframe(void *data, calldata_t *cd)
@@ -1062,16 +1065,11 @@ static void find_next_replay_keyframe(void *data, calldata_t *cd)
 	struct ffmpeg_muxer *stream = data;
 	const int64_t time_usec = calldata_int(cd, "time_usec");
 	struct replay_buffer_keyframe_info frame_info = {0};
-	size_t index = 0;
+	size_t ordinal = 0;
 
-	if (replay_buffer_cache_find_next_keyframe(stream->replay_cache, time_usec, &index) &&
-	    replay_buffer_cache_get_keyframe_info(stream->replay_cache, index, &frame_info)) {
-		calldata_set_int(cd, "index", (long long)index);
-		calldata_set_int(cd, "dts_usec", frame_info.dts_usec);
-	} else {
-		calldata_set_int(cd, "index", -1);
-		calldata_set_int(cd, "dts_usec", 0);
-	}
+	const bool found = replay_buffer_cache_find_next_keyframe(stream->replay_cache, time_usec, &ordinal) &&
+			   replay_buffer_cache_get_keyframe_info(stream->replay_cache, ordinal, &frame_info);
+	set_replay_keyframe_result(cd, found, ordinal, &frame_info);
 }
 
 static void request_replay_full_frame(void *data, calldata_t *cd)
@@ -1113,6 +1111,14 @@ static void copy_replay_full_frame(void *data, calldata_t *cd)
 	calldata_set_int(cd, "size", (long long)size);
 }
 
+static void get_replay_export_status(void *data, calldata_t *cd)
+{
+	struct ffmpeg_muxer *stream = data;
+
+	calldata_set_int(cd, "state", os_atomic_load_long(&stream->export_state));
+	calldata_set_int(cd, "error", os_atomic_load_long(&stream->export_error));
+}
+
 static bool replay_buffer_begin_mux(struct ffmpeg_muxer *stream);
 static void replay_buffer_prepare_packets(struct ffmpeg_muxer *stream, replay_buffer_snapshot_t *snapshot);
 static void replay_buffer_make_temp_path(const char *final_path, struct dstr *temp_path);
@@ -1126,26 +1132,27 @@ static void export_replay_selection(void *data, calldata_t *cd)
 	const int64_t end_usec = calldata_int(cd, "end_usec");
 	int64_t actual_start = 0;
 	int64_t actual_end = 0;
-	int result = REPLAY_EXPORT_ERR_INVALID;
+	int result = REPLAY_BUFFER_EXPORT_ERR_INVALID;
 
 	if (!active(stream)) {
-		result = REPLAY_EXPORT_ERR_INACTIVE;
+		result = REPLAY_BUFFER_EXPORT_ERR_INACTIVE;
 	} else if (start_usec >= end_usec) {
-		result = REPLAY_EXPORT_ERR_INVALID;
-	} else if (!replay_buffer_cache_resolve_range(stream->replay_cache, start_usec, end_usec, &actual_start,
-						      &actual_end)) {
-		blog(LOG_WARNING, "[replay buffer] export: %.3fs - %.3fs does not resolve to a range",
-		     (double)start_usec / 1000000.0, (double)end_usec / 1000000.0);
-		result = REPLAY_EXPORT_ERR_INVALID;
-	} else if (!replay_buffer_begin_mux(stream)) {
-		result = REPLAY_EXPORT_ERR_BUSY;
+		result = REPLAY_BUFFER_EXPORT_ERR_INVALID;
 	} else {
+		/* Resolve the range and take packet references in one pass. The
+		 * snapshot also reports the range the cache actually settled on, so
+		 * there is no second scan and no window between validation and
+		 * snapshot creation. */
 		replay_buffer_snapshot_t *snapshot = replay_buffer_cache_create_range_snapshot(
 			stream->replay_cache, start_usec, end_usec, &actual_start, &actual_end);
 
 		if (!snapshot) {
-			os_atomic_set_bool(&stream->muxing, false);
-			result = REPLAY_EXPORT_ERR_INVALID;
+			blog(LOG_WARNING, "[replay buffer] export: %.3fs - %.3fs does not resolve to a range",
+			     (double)start_usec / 1000000.0, (double)end_usec / 1000000.0);
+			result = REPLAY_BUFFER_EXPORT_ERR_INVALID;
+		} else if (!replay_buffer_begin_mux(stream)) {
+			replay_buffer_snapshot_release(snapshot);
+			result = REPLAY_BUFFER_EXPORT_ERR_BUSY;
 		} else {
 			stream->selection_export = true;
 			replay_buffer_prepare_packets(stream, snapshot);
@@ -1159,8 +1166,8 @@ static void export_replay_selection(void *data, calldata_t *cd)
 			replay_buffer_make_temp_path(stream->selection_path.array, &stream->path);
 			os_unlink(stream->path.array);
 
-			os_atomic_set_long(&stream->export_error, REPLAY_EXPORT_ERR_NONE);
-			os_atomic_set_long(&stream->export_state, REPLAY_EXPORT_RUNNING);
+			os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_NONE);
+			os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_RUNNING);
 
 			stream->mux_thread_joinable =
 				pthread_create(&stream->mux_thread, NULL, replay_buffer_mux_thread, stream) == 0;
@@ -1168,12 +1175,12 @@ static void export_replay_selection(void *data, calldata_t *cd)
 				warn("Failed to create replay selection muxer thread");
 				replay_buffer_free_mux_packets(stream);
 				stream->selection_export = false;
-				os_atomic_set_long(&stream->export_state, REPLAY_EXPORT_FAILED);
-				os_atomic_set_long(&stream->export_error, REPLAY_EXPORT_ERR_WRITE);
+				os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_FAILED);
+				os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_WRITE);
 				os_atomic_set_bool(&stream->muxing, false);
-				result = REPLAY_EXPORT_ERR_WRITE;
+				result = REPLAY_BUFFER_EXPORT_ERR_WRITE;
 			} else {
-				result = REPLAY_EXPORT_ERR_NONE;
+				result = REPLAY_BUFFER_EXPORT_ERR_NONE;
 			}
 		}
 	}
@@ -1223,36 +1230,50 @@ static void *replay_buffer_create(obs_data_t *settings, obs_output_t *output)
 		return NULL;
 	}
 
-	os_atomic_set_long(&stream->export_state, REPLAY_EXPORT_IDLE);
-	os_atomic_set_long(&stream->export_error, REPLAY_EXPORT_ERR_NONE);
+	os_atomic_set_long(&stream->export_state, REPLAY_BUFFER_EXPORT_IDLE);
+	os_atomic_set_long(&stream->export_error, REPLAY_BUFFER_EXPORT_ERR_NONE);
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
-	proc_handler_add(ph, "void save()", save_replay_proc, stream);
-	proc_handler_add(ph, "void get_last_replay(out string path)", get_last_replay, stream);
+	proc_handler_add(ph, "void " REPLAY_BUFFER_PROC_SAVE "()", save_replay_proc, stream);
+	proc_handler_add(ph, "void " REPLAY_BUFFER_PROC_GET_LAST_REPLAY "(out string path)", get_last_replay, stream);
 	proc_handler_add(ph,
-			 "void get_replay_buffer_info(out int start_time_usec, out int end_time_usec, "
-			 "out int keyframe_count, out int max_time_usec)",
+			 "void " REPLAY_BUFFER_PROC_GET_INFO
+			 "(out int start_time_usec, out int end_time_usec, out int keyframe_count, "
+			 "out int max_time_usec, out int packet_count, out int bytes, "
+			 "out int dropped_packets, out int dropped_bytes, out int dropped_keyframes, "
+			 "out int push_failures)",
 			 get_replay_buffer_info, stream);
 
-	proc_handler_add(ph, "void find_replay_keyframe(int time_usec, out int index, out int dts_usec)",
+	proc_handler_add(ph,
+			 "void " REPLAY_BUFFER_PROC_FIND_KEYFRAME
+			 "(int time_usec, out int ordinal, out int dts_usec, out int duration_usec)",
 			 find_replay_keyframe, stream);
-	proc_handler_add(ph, "void find_prev_replay_keyframe(int time_usec, out int index, out int dts_usec)",
+	proc_handler_add(ph,
+			 "void " REPLAY_BUFFER_PROC_FIND_PREV_KEYFRAME
+			 "(int time_usec, out int ordinal, out int dts_usec, out int duration_usec)",
 			 find_prev_replay_keyframe, stream);
-	proc_handler_add(ph, "void find_next_replay_keyframe(int time_usec, out int index, out int dts_usec)",
+	proc_handler_add(ph,
+			 "void " REPLAY_BUFFER_PROC_FIND_NEXT_KEYFRAME
+			 "(int time_usec, out int ordinal, out int dts_usec, out int duration_usec)",
 			 find_next_replay_keyframe, stream);
-	proc_handler_add(ph, "void request_replay_full_frame(int time_usec, int request_id, out int accepted)",
+	proc_handler_add(ph,
+			 "void " REPLAY_BUFFER_PROC_REQUEST_FULL_FRAME
+			 "(int time_usec, int request_id, out int accepted)",
 			 request_replay_full_frame, stream);
 	proc_handler_add(ph,
-			 "void copy_replay_full_frame(int request_id, int capacity, in ptr dst, "
-			 "out int status, out int width, out int height, out int size)",
+			 "void " REPLAY_BUFFER_PROC_COPY_FULL_FRAME
+			 "(int request_id, int capacity, in ptr dst, out int status, out int width, "
+			 "out int height, out int size)",
 			 copy_replay_full_frame, stream);
 
 	proc_handler_add(ph,
-			 "void export_replay_selection(int start_usec, int end_usec, out int result, "
-			 "out int actual_start_usec, out int actual_end_usec)",
+			 "void " REPLAY_BUFFER_PROC_EXPORT_SELECTION
+			 "(int start_usec, int end_usec, out int result, out int actual_start_usec, "
+			 "out int actual_end_usec)",
 			 export_replay_selection, stream);
-	proc_handler_add(ph, "void get_replay_export_status(out int state, out int error)", get_replay_export_status,
-			 stream);
+	proc_handler_add(ph,
+			 "void " REPLAY_BUFFER_PROC_GET_EXPORT_STATUS "(out int state, out int error)",
+			 get_replay_export_status, stream);
 
 	signal_handler_t *sh = obs_output_get_signal_handler(output);
 	signal_handler_add(sh, "void saved()");
@@ -1409,8 +1430,10 @@ finish: {
 		if (error)
 			os_unlink(stream->path.array);
 
-		os_atomic_set_long(&stream->export_error, error ? REPLAY_EXPORT_ERR_WRITE : REPLAY_EXPORT_ERR_NONE);
-		os_atomic_set_long(&stream->export_state, error ? REPLAY_EXPORT_FAILED : REPLAY_EXPORT_DONE);
+		os_atomic_set_long(&stream->export_error,
+				   error ? REPLAY_BUFFER_EXPORT_ERR_WRITE : REPLAY_BUFFER_EXPORT_ERR_NONE);
+		os_atomic_set_long(&stream->export_state,
+				   error ? REPLAY_BUFFER_EXPORT_FAILED : REPLAY_BUFFER_EXPORT_DONE);
 		stream->selection_export = false;
 	} else if (!error) {
 		info("Wrote replay buffer to '%s'", stream->path.array);

@@ -434,9 +434,10 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	/* Resolve the keyframe by time: the cache maps the timestamp to the GOP that
 	 * covers it and hands back that packet's absolute index, so the packets that
 	 * follow can be walked without any sequence bookkeeping. */
-	/* One GOP plus the packets up to the requested moment: a keyframe alone only
-	 * shows the start of the GOP, and with a four second keyframe interval that
-	 * makes scrubbing look like it does not follow the playhead. */
+	/* A keyframe plus a few following video packets: a lone keyframe may not
+	 * decode when the encoder emits B-frames and an open GOP, and the review
+	 * canvas shows a representative frame for the GOP rather than an exact
+	 * seek. Keep the walk short so a fast drag stays responsive. */
 	struct encoder_packet packets[33];
 	size_t count = 0;
 
