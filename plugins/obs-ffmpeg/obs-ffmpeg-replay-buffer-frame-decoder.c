@@ -30,6 +30,11 @@
 struct replay_buffer_decoder {
 	AVCodecContext *decoder;
 	SwsContext *scaler;
+	/* Colour description currently applied to scaler; -1 means the context was
+	 * just rebuilt and still carries libswscale's own defaults. */
+	int scaler_colorspace;
+	int scaler_range;
+	bool hdr_reported;
 	bool failed;
 	bool has_extradata;
 	int failures;
@@ -281,6 +286,58 @@ static bool decoder_open(replay_buffer_frame_decoder_t *frame_decoder, struct re
 	return true;
 }
 
+/* libswscale ignores AVFrame colour metadata in sws_scale(); the coefficients
+ * have to be pushed into the context explicitly. The mapping follows the one
+ * OBS uses for its own scaler (video-scaler-ffmpeg.c).
+ *
+ * The common SDR HD case is special: before this preview handled colour at
+ * all, libswscale's default coefficients were used, and those are BT.601
+ * (SWS_CS_DEFAULT). That look is kept deliberately so existing previews do not
+ * shift. It is set explicitly rather than skipped, because the scaler context
+ * is reused: skipping would leave whatever the previous source configured
+ * (601 full range, BT.2020, ...) in place. Do not "fix" this to ITU709
+ * without re-checking the expected preview colours. */
+static int scaler_colorspace_for(const AVFrame *frame)
+{
+	if (frame->color_range != AVCOL_RANGE_JPEG) {
+		switch (frame->colorspace) {
+		case AVCOL_SPC_UNSPECIFIED:
+		case AVCOL_SPC_RESERVED:
+		case AVCOL_SPC_BT709:
+			return SWS_CS_DEFAULT;
+		default:
+			break;
+		}
+	}
+
+	switch (frame->colorspace) {
+	case AVCOL_SPC_BT470BG:
+	case AVCOL_SPC_SMPTE170M:
+		return SWS_CS_ITU601;
+	case AVCOL_SPC_SMPTE240M:
+		return SWS_CS_SMPTE240M;
+	case AVCOL_SPC_FCC:
+		return SWS_CS_FCC;
+	case AVCOL_SPC_BT2020_NCL:
+	case AVCOL_SPC_BT2020_CL:
+		return SWS_CS_BT2020;
+	case AVCOL_SPC_BT709:
+	default:
+		return SWS_CS_ITU709;
+	}
+}
+
+/* The preview target is full-range sRGB, so only the source range varies. */
+static int scaler_range_for(const AVFrame *frame)
+{
+	return frame->color_range == AVCOL_RANGE_JPEG ? 1 : 0;
+}
+
+static bool frame_is_hdr(const AVFrame *frame)
+{
+	return frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+}
+
 static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct replay_buffer_decoder *decoder,
 			   const struct encoder_packet *packets, size_t count, uint64_t request_id, uint8_t **out_rgba,
 			   uint32_t *out_width, uint32_t *out_height)
@@ -417,12 +474,45 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 		return false;
 	}
 
-	decoder->scaler = sws_getCachedContext(decoder->scaler, last->width, last->height,
-					       (enum AVPixelFormat)last->format, width, height, AV_PIX_FMT_RGBA,
-					       SWS_BILINEAR, NULL, NULL, NULL);
-	if (!decoder->scaler) {
+	SwsContext *scaler = sws_getCachedContext(decoder->scaler, last->width, last->height,
+						  (enum AVPixelFormat)last->format, width, height, AV_PIX_FMT_RGBA,
+						  SWS_BILINEAR, NULL, NULL, NULL);
+	if (!scaler) {
 		av_frame_free(&last);
 		return false;
+	}
+
+	/* A rebuilt context (resolution or format switch, e.g. 4K <-> 1080p)
+	 * starts over with libswscale's defaults, so the colour description has to
+	 * be applied again even when it did not change. */
+	if (scaler != decoder->scaler) {
+		decoder->scaler = scaler;
+		decoder->scaler_colorspace = -1;
+		decoder->scaler_range = -1;
+	}
+
+	const int colorspace = scaler_colorspace_for(last);
+	const int src_range = scaler_range_for(last);
+	if (decoder->scaler_colorspace != colorspace || decoder->scaler_range != src_range) {
+		const int *coefficients = sws_getCoefficients(colorspace);
+		if (sws_setColorspaceDetails(decoder->scaler, coefficients, src_range, coefficients, 1, 0, 1 << 16,
+					     1 << 16) < 0) {
+			blog(LOG_DEBUG, "[replay] sws_setColorspaceDetails failed, keeping the previous conversion");
+		}
+		decoder->scaler_colorspace = colorspace;
+		decoder->scaler_range = src_range;
+	}
+
+	/* PQ/HLG has no tone mapping here: the frame only gets the BT.2020 matrix
+	 * applied before being written as 8-bit sRGB, so HDR material looks darker
+	 * and washed out compared to the recording. A faithful conversion needs a
+	 * 16-bit pass with a transfer-function mapping, which this preview does not
+	 * have. */
+	if (!decoder->hdr_reported && frame_is_hdr(last)) {
+		decoder->hdr_reported = true;
+		blog(LOG_INFO,
+		     "[replay] HDR source (%s) is previewed without tone mapping; colours and brightness will differ from the recording",
+		     last->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ" : "HLG");
 	}
 
 	const size_t size = row_size * (size_t)height;
