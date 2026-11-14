@@ -7,20 +7,28 @@
 
 #include <string.h>
 
-/* Smallest ring the cache allocates; it doubles from here as the buffer fills. */
-#define REPLAY_BUFFER_MIN_SLOTS 1024
+/* Packets live in blocks of this many slots. Memory grows one block at a time
+ * and is handed back one block at a time once history has rolled past it, so the
+ * footprint follows the buffer in the same fixed step instead of doubling. */
+#define REPLAY_BUFFER_BLOCK_PACKETS 1024
+
+/* The block pointer table grows in this fixed step as well. */
+#define REPLAY_BUFFER_BLOCK_STEP 16
 
 /* Written when a slot owns a reference and cleared when it is released, so a
  * slot can only ever be released once. */
 #define REPLAY_BUFFER_SLOT_LIVE 0x52425331u
 
-/* The packet store is addressed by absolute packet index. The ring slot for an
- * index is simply "index % capacity", so there is no head pointer, no count and
- * no per-GOP packet counter: the only positions the cache keeps are the first
- * and the next index, and both only ever move forward when a packet is stored or
- * a whole GOP is dropped. Nothing derives a slot from a counter that could drift
- * out of step with the ring, and every slot carries the index it holds, so a
- * lookup either finds that exact packet or nothing at all. */
+/* The packet store is addressed by absolute packet index. Its block is
+ * "index / REPLAY_BUFFER_BLOCK_PACKETS" and the slot inside it is the remainder,
+ * so no position is ever derived from a counter: the cache keeps only the first
+ * and the next index, and both only move when a packet is stored or a whole GOP
+ * is dropped. Every slot also carries the index it holds, so a lookup either
+ * finds that exact packet or nothing at all.
+ *
+ * Blocks are allocated and released in fixed steps, which keeps the footprint
+ * proportional to the buffered history: no doubling, no re-placing of live
+ * packets when the store grows. */
 struct replay_buffer_packet {
 	struct encoder_packet packet;
 	uint64_t index;
@@ -38,8 +46,12 @@ struct replay_buffer_gop {
 struct replay_buffer_cache {
 	pthread_mutex_t mutex;
 
-	struct replay_buffer_packet *slots;
-	size_t capacity;
+	/* blocks[0] holds absolute block "first_block"; free blocks are handed back
+	 * from the front as history rolls. */
+	struct replay_buffer_packet **blocks;
+	size_t blocks_num;
+	size_t blocks_capacity;
+	uint64_t first_block;
 
 	uint64_t first_index;
 	uint64_t next_index;
@@ -75,10 +87,16 @@ static struct replay_buffer_gop *cache_gop_at(const replay_buffer_cache_t *cache
 	return &cache->gops.array[cache->gops_head + index];
 }
 
+static uint64_t cache_block_of(uint64_t index)
+{
+	return index / REPLAY_BUFFER_BLOCK_PACKETS;
+}
+
 /* Raw slot for an absolute index, without checking what the slot holds. */
 static struct replay_buffer_packet *cache_slot_at(replay_buffer_cache_t *cache, uint64_t index)
 {
-	return &cache->slots[index % cache->capacity];
+	const size_t block = (size_t)(cache_block_of(index) - cache->first_block);
+	return &cache->blocks[block][index % REPLAY_BUFFER_BLOCK_PACKETS];
 }
 
 /* Slot for an absolute index, but only when it really holds that packet. */
@@ -114,28 +132,59 @@ static void cache_release_slot(replay_buffer_cache_t *cache, uint64_t index)
 	obs_encoder_packet_release(&slot->packet);
 }
 
-/* Grows the ring and re-places the live packets. Empty slots are zeroed, so
- * their marker never looks live. */
-static bool cache_reserve_slots(replay_buffer_cache_t *cache, size_t needed)
+/* Makes sure the block that holds index exists. Blocks are zeroed, so their
+ * slots never look live before a packet is stored in them. */
+static bool cache_ensure_packet(replay_buffer_cache_t *cache, uint64_t index)
 {
-	if (needed <= cache->capacity)
-		return true;
+	const uint64_t block = cache_block_of(index);
 
-	size_t capacity = cache->capacity ? cache->capacity : REPLAY_BUFFER_MIN_SLOTS;
-	while (capacity < needed)
-		capacity *= 2;
-
-	struct replay_buffer_packet *slots = bzalloc(sizeof(*slots) * capacity);
-	if (!slots)
+	/* Indices only move forward, so a block before the table start means the
+	 * caller asked for history that is already gone. */
+	if (block < cache->first_block)
 		return false;
 
-	for (uint64_t index = cache->first_index; index < cache->next_index; index++)
-		slots[index % capacity] = *cache_slot_at(cache, index);
+	const size_t offset = (size_t)(block - cache->first_block);
 
-	bfree(cache->slots);
-	cache->slots = slots;
-	cache->capacity = capacity;
+	if (offset < cache->blocks_num)
+		return true;
+
+	if (cache->blocks_num == cache->blocks_capacity) {
+		const size_t capacity = cache->blocks_capacity + REPLAY_BUFFER_BLOCK_STEP;
+		struct replay_buffer_packet **blocks = brealloc(cache->blocks, sizeof(*blocks) * capacity);
+		if (!blocks)
+			return false;
+
+		cache->blocks = blocks;
+		cache->blocks_capacity = capacity;
+	}
+
+	struct replay_buffer_packet *fresh = bzalloc(sizeof(*fresh) * REPLAY_BUFFER_BLOCK_PACKETS);
+	if (!fresh)
+		return false;
+
+	cache->blocks[cache->blocks_num++] = fresh;
 	return true;
+}
+
+/* Hands back the blocks whose packets have all been dropped. */
+static void cache_release_blocks(replay_buffer_cache_t *cache)
+{
+	if (cache->first_index >= cache->next_index) {
+		for (size_t i = 0; i < cache->blocks_num; i++)
+			bfree(cache->blocks[i]);
+		cache->blocks_num = 0;
+		cache->first_block = cache_block_of(cache->first_index);
+		return;
+	}
+
+	const uint64_t keep = cache_block_of(cache->first_index);
+
+	while (cache->first_block < keep && cache->blocks_num > 1) {
+		bfree(cache->blocks[0]);
+		memmove(cache->blocks, cache->blocks + 1, (cache->blocks_num - 1) * sizeof(*cache->blocks));
+		cache->blocks_num--;
+		cache->first_block++;
+	}
 }
 
 static void cache_compact_gops(replay_buffer_cache_t *cache)
@@ -171,6 +220,7 @@ static void cache_drop_front_gop(replay_buffer_cache_t *cache)
 		cache->gops_head++;
 
 	cache_compact_gops(cache);
+	cache_release_blocks(cache);
 
 	if (cache->first_index >= cache->next_index) {
 		cache->first_dts_usec = 0;
@@ -224,7 +274,7 @@ void replay_buffer_cache_destroy(replay_buffer_cache_t *cache)
 		return;
 
 	replay_buffer_cache_clear(cache);
-	bfree(cache->slots);
+	bfree(cache->blocks);
 	da_free(cache->gops);
 	pthread_mutex_destroy(&cache->mutex);
 	bfree(cache);
@@ -259,6 +309,7 @@ void replay_buffer_cache_clear(replay_buffer_cache_t *cache)
 	cache->first_dts_usec = 0;
 	cache->last_dts_usec = 0;
 	cache->total_size = 0;
+	cache_release_blocks(cache);
 
 	pthread_mutex_unlock(&cache->mutex);
 }
@@ -280,7 +331,7 @@ void replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		return;
 	}
 
-	if (!cache_reserve_slots(cache, cache_packet_count(cache) + 1)) {
+	if (!cache_ensure_packet(cache, cache->next_index)) {
 		pthread_mutex_unlock(&cache->mutex);
 		return;
 	}
