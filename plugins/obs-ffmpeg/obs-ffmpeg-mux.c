@@ -1430,22 +1430,28 @@ finish: {
 		if (error)
 			os_unlink(stream->path.array);
 
-		os_atomic_set_long(&stream->export_error,
-				   error ? REPLAY_BUFFER_EXPORT_ERR_WRITE : REPLAY_BUFFER_EXPORT_ERR_NONE);
-		os_atomic_set_long(&stream->export_state,
-				   error ? REPLAY_BUFFER_EXPORT_FAILED : REPLAY_BUFFER_EXPORT_DONE);
 		stream->selection_export = false;
 	} else if (!error) {
 		info("Wrote replay buffer to '%s'", stream->path.array);
 	}
 
 	/* muxing must be cleared before signalling: get_last_replay only returns
-	 * the path when no mux is in flight. Nothing else may touch the exporter
-	 * state after this point. */
+	 * the path when no mux is in flight. The export result is published after
+	 * that, so a reader that observes DONE also observes the final path. */
 	os_atomic_set_bool(&stream->muxing, false);
 	stream->replay_mux = false;
 
-	if (!error) {
+	if (selection_export) {
+		os_atomic_set_long(&stream->export_error,
+				   error ? REPLAY_BUFFER_EXPORT_ERR_WRITE : REPLAY_BUFFER_EXPORT_ERR_NONE);
+		os_atomic_set_long(&stream->export_state,
+				   error ? REPLAY_BUFFER_EXPORT_FAILED : REPLAY_BUFFER_EXPORT_DONE);
+	}
+
+	/* Only a whole-buffer save is a "replay saved": the frontend answers that
+	 * signal with a status bar message, AutoRemux and a frontend event, while a
+	 * selection export reports its own result. */
+	if (!error && !selection_export) {
 		calldata_t cd = {0};
 		signal_handler_t *sh = obs_output_get_signal_handler(stream->output);
 		signal_handler_signal(sh, "saved", &cd);

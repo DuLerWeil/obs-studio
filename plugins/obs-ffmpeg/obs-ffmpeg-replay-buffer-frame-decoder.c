@@ -369,7 +369,7 @@ static bool decoder_decode(replay_buffer_frame_decoder_t *frame_decoder, struct 
 	av_frame_free(&frame);
 
 	if (!have_last) {
-		blog(LOG_INFO, "[replay buffer] decode: no frame from %zu packets (last send %d, last receive %d)",
+		blog(LOG_DEBUG, "[replay buffer] decode: no frame from %zu packets (last send %d, last receive %d)",
 		     count, last_send_ret, last_receive_ret);
 		av_frame_free(&last);
 		/* Some encoders only expose extradata after the first packet. If it
@@ -470,7 +470,7 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 		for (size_t i = 0; i < count; i++)
 			obs_encoder_packet_release(&packets[i]);
 	} else {
-		blog(LOG_INFO, "[replay buffer] frame %llu: no video keyframe near %.3fs",
+		blog(LOG_DEBUG, "[replay buffer] frame %llu: no video keyframe near %.3fs",
 		     (unsigned long long)request_id, (double)time_usec / 1000000.0);
 	}
 
@@ -493,7 +493,7 @@ static void frame_process(replay_buffer_frame_decoder_t *frame_decoder, int64_t 
 	if (rgba)
 		bfree(rgba);
 
-	blog(LOG_INFO, "[replay buffer] frame %llu: %s (%zu packets)", (unsigned long long)request_id,
+	blog(LOG_DEBUG, "[replay buffer] frame %llu: %s (%zu packets)", (unsigned long long)request_id,
 	     decoded ? "decoded" : "failed", count);
 }
 
@@ -520,7 +520,7 @@ static void *frame_thread(void *param)
 		frame_decoder->has_request = false;
 		pthread_mutex_unlock(&frame_decoder->mutex);
 
-		blog(LOG_INFO, "[replay buffer] frame %llu: decoding at %.3fs", (unsigned long long)request_id,
+		blog(LOG_DEBUG, "[replay buffer] frame %llu: decoding at %.3fs", (unsigned long long)request_id,
 		     (double)time_usec / 1000000.0);
 		frame_process(frame_decoder, time_usec, request_id);
 	}

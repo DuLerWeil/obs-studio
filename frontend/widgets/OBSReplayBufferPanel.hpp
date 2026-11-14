@@ -168,6 +168,7 @@ private:
 	void AttachReviewDisplay(OBSQTDisplay *display);
 	void SetReviewActive(bool active);
 	void SetReviewFrame(const QImage &image);
+	void SetReviewStale(bool stale);
 	void ClearReviewFrame();
 	void RenderReviewFrame(uint32_t cx, uint32_t cy);
 	static void DrawReviewFrame(void *param, uint32_t cx, uint32_t cy);
@@ -205,11 +206,14 @@ private:
 	std::mutex reviewMutex_;
 	bool reviewActive_ = false;
 	bool reviewClear_ = false;
+	/* The last decode failed, so the canvas still shows an older frame. */
+	bool reviewStale_ = false;
 
 	QTimer infoTimer_;
 	QTimer fullFrameTimer_;
 	QTimer exportTimer_;
 	QElapsedTimer fullFrameElapsed_;
+	QElapsedTimer exportElapsed_;
 
 	int64_t rangeStartUsec_ = 0;
 	int64_t rangeEndUsec_ = 0;

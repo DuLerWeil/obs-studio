@@ -19,6 +19,7 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPixmap>
 #include <QPointF>
 #include <QPolygonF>
 #include <QSize>
@@ -58,6 +59,9 @@ constexpr int kTickHeight = 12;
 constexpr int kRulerMinSpacing = 80;
 /* Floor for the wheel zoom, so a notch cannot collapse the scale to nothing. */
 constexpr int64_t kMinZoomSpan = 2000000;
+/* An export is a remux of already encoded packets, so anything this long means
+ * the helper is stuck. The timer only frees the UI; it never kills the mux. */
+constexpr int kExportTimeoutMs = 30000;
 
 /* Same tick colour the mixer's volume scale uses (VolumeSlider::paintEvent),
  * so the two scales read as the same control. */
@@ -616,6 +620,14 @@ void OBSReplayBufferTimeline::mousePressEvent(QMouseEvent *event)
 
 void OBSReplayBufferTimeline::mouseMoveEvent(QMouseEvent *event)
 {
+	/* The release is lost when the buffer stops mid-drag and the panel is
+	 * hidden, so trust the button state rather than the last press. Otherwise
+	 * the playhead would follow the cursor without a button held. */
+	if ((draggingPosition_ || draggingSelection_) && !(event->buttons() & Qt::LeftButton)) {
+		draggingPosition_ = false;
+		draggingSelection_ = false;
+	}
+
 	if (draggingPosition_) {
 		position_ = TimeAt(event->pos().x());
 		update();
@@ -748,7 +760,10 @@ void OBSReplayBufferTimeline::wheelEvent(QWheelEvent *event)
 	const int64_t span = AxisSpan();
 	const int64_t pivot = AxisStart() + (int64_t)(ratio * (double)span);
 	const double factor = delta > 0 ? 0.75 : 1.35;
-	const int64_t next = qBound(kMinZoomSpan, (int64_t)((double)span * factor), full);
+	/* A buffer shorter than the zoom floor must not make qBound's lower bound
+	 * larger than its upper bound. */
+	const int64_t lower = qMin(kMinZoomSpan, full);
+	const int64_t next = qBound(lower, (int64_t)((double)span * factor), full);
 
 	if (frozen_) {
 		/* Zooming a pinned axis only changes how much of it is shown; the window
@@ -816,6 +831,12 @@ OBSReplayBufferPanel::OBSReplayBufferPanel(OBSBasic *main, OBSQTDisplay *preview
 	 * but never grows past the height of its own rows. */
 	setAutoFillBackground(false);
 	setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+
+	/* A recreated display destroys its draw callbacks; drop the handle with it so
+	 * the old pointer is never used again. */
+	if (preview_)
+		connect(preview_, &OBSQTDisplay::DisplayCreated, this,
+			[this](OBSQTDisplay *) { reviewDisplay_ = nullptr; });
 
 	/* The scale and its two markers carry the timing, so the only text left is
 	 * the transient export status. */
@@ -967,9 +988,21 @@ void OBSReplayBufferPanel::UpdateCollapseButtonSize()
 
 void OBSReplayBufferPanel::ApplyCollapseIcon()
 {
+	if (!collapseButton_) {
+		return;
+	}
+
 	const QIcon base = ThemeIcon(collapsed_ ? "up.svg" : "down.svg");
-	collapseButton_->setIconSize(QSize(collapseIconSide_, collapseIconSide_));
-	collapseButton_->setIcon(QIcon(base.pixmap(QSize(collapseIconSide_, collapseIconSide_))));
+	const QSize side(collapseIconSide_, collapseIconSide_);
+	collapseButton_->setIconSize(side);
+
+	/* The glyph is rasterized so the theme's icon-size cannot blow it up again,
+	 * but it has to keep the widget's device pixel ratio or it looks blurry on a
+	 * scaled display. */
+	const qreal dpr = devicePixelRatioF();
+	QPixmap pixmap = base.pixmap(side, dpr);
+	pixmap.setDevicePixelRatio(dpr);
+	collapseButton_->setIcon(QIcon(pixmap));
 }
 
 OBSReplayBufferPanel::~OBSReplayBufferPanel()
@@ -1017,6 +1050,9 @@ void OBSReplayBufferPanel::changeEvent(QEvent *event)
 
 	if (event->type() == QEvent::PaletteChange) {
 		UpdateSecondaryTextColors();
+		/* The chevron is a cached raster of a theme glyph, so it has to be
+		 * rebuilt with the new theme's colors instead of keeping the old ones. */
+		ApplyCollapseIcon();
 	}
 }
 
@@ -1072,6 +1108,10 @@ void OBSReplayBufferPanel::UpdateReviewState()
 	 * callback list dies with it. */
 	if (reviewing) {
 		AttachReviewDisplay(preview_);
+	} else {
+		/* The live program is on the canvas again, so any stale-frame warning
+		 * would describe a picture that is no longer shown. */
+		SetReviewStale(false);
 	}
 
 	SetReviewActive(reviewing);
@@ -1127,7 +1167,7 @@ void OBSReplayBufferPanel::SetReviewFrame(const QImage &image)
 	reviewActive_ = true;
 	reviewClear_ = false;
 	reviewPending_ = frame;
-	blog(LOG_INFO, "[replay buffer] review: stored %dx%d frame", frame.width(), frame.height());
+	blog(LOG_DEBUG, "[replay buffer] review: stored %dx%d frame", frame.width(), frame.height());
 }
 
 void OBSReplayBufferPanel::ClearReviewFrame()
@@ -1193,7 +1233,7 @@ void OBSReplayBufferPanel::RenderReviewFrame(uint32_t cx, uint32_t cy)
 		const uint8_t *data = pending.constBits();
 		reviewTexture_ =
 			gs_texture_create((uint32_t)pending.width(), (uint32_t)pending.height(), GS_RGBA, 1, &data, 0);
-		blog(LOG_INFO, "[replay buffer] review: uploaded %dx%d frame", pending.width(), pending.height());
+		blog(LOG_DEBUG, "[replay buffer] review: uploaded %dx%d frame", pending.width(), pending.height());
 	}
 
 	if (!reviewTexture_ || !cx || !cy) {
@@ -1274,7 +1314,7 @@ void OBSReplayBufferPanel::HidePanel()
 	exportTimer_.stop();
 
 	CancelFullFrame();
-
+	SetReviewStale(false);
 	timeline_->ClearSelection();
 	exportRunning_ = false;
 	followLive_ = true;
@@ -1387,6 +1427,8 @@ void OBSReplayBufferPanel::RefreshInfo()
 	const int64_t maxTime = calldata_int(&cd, "max_time_usec");
 	calldata_free(&cd);
 
+	bool resetZoom = false;
+
 	if (count <= 0 || end <= start) {
 		/* The buffer is running but has nothing to show yet. Keep an empty scale
 		 * on screen instead of hiding the strip and popping it in later. */
@@ -1399,6 +1441,7 @@ void OBSReplayBufferPanel::RefreshInfo()
 		UpdateControls();
 		ShowPanel(true);
 		SetReviewActive(false);
+		SetReviewStale(false);
 		return;
 	}
 
@@ -1407,14 +1450,23 @@ void OBSReplayBufferPanel::RefreshInfo()
 	rangeStartUsec_ = qMax<int64_t>(0, start);
 	rangeEndUsec_ = qMax<int64_t>(rangeStartUsec_, end);
 
-	if (followLive_ || positionUsec_ < rangeStartUsec_ || positionUsec_ > rangeEndUsec_) {
+	if (followLive_) {
 		positionUsec_ = rangeEndUsec_;
+	} else if (positionUsec_ < rangeStartUsec_ || positionUsec_ > rangeEndUsec_) {
+		/* The rolling window dropped the moment being reviewed. Follow live again
+		 * and bring the axis back to the live window, instead of leaving a zoom
+		 * parked somewhere in the past. */
+		positionUsec_ = rangeEndUsec_;
+		followLive_ = true;
+		resetZoom = true;
 	}
 
 	/* The axis is built from the configured limit, not from the length that
 	 * happens to be buffered, so the scale does not grow while it fills up. */
 	timeline_->SetMaxDuration(maxTime);
 	timeline_->SetRange(rangeStartUsec_, rangeEndUsec_);
+	if (resetZoom)
+		timeline_->ResetZoom();
 	timeline_->SetPosition(positionUsec_);
 	/* A clip that reaches the live edge keeps growing with the buffer; the
 	 * timeline owns the selection, so nothing is mirrored here. */
@@ -1440,10 +1492,36 @@ void OBSReplayBufferPanel::RefreshInfo()
 
 void OBSReplayBufferPanel::UpdateLabels()
 {
-	/* The axis and its markers carry the timing; the only text left is the
-	 * transient export status, and it takes no room when idle. */
-	cacheLabel_->setText(QTStr("Basic.Main.Preview.ReplayBuffer.Exporting"));
-	cacheLabel_->setVisible(exportRunning_);
+	/* The axis and its markers carry the timing; the only text left is status,
+	 * and it takes no room when idle. */
+	QString text;
+	if (exportRunning_) {
+		text = QTStr("Basic.Main.Preview.ReplayBuffer.Exporting");
+	} else if (reviewStale_) {
+		/* The canvas keeps the previous frame when decoding fails; say so instead
+		 * of leaving the user with a picture that does not match the playhead. */
+		text = QTStr("Basic.Main.Preview.ReplayBuffer.StaleFrame");
+	}
+
+	cacheLabel_->setText(text);
+	/* Same rule as UpdateCollapsedState: the status lives in a folded row. */
+	cacheLabel_->setVisible(!collapsed_ && !text.isEmpty());
+}
+
+void OBSReplayBufferPanel::SetReviewStale(bool stale)
+{
+	/* At the live edge the canvas shows the program, not a reviewed frame, so
+	 * there is no stale picture to warn about. */
+	if (stale && !Reviewing()) {
+		stale = false;
+	}
+
+	if (reviewStale_ == stale) {
+		return;
+	}
+
+	reviewStale_ = stale;
+	UpdateLabels();
 }
 
 void OBSReplayBufferPanel::UpdateControls()
@@ -1498,7 +1576,13 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	}
 
 	positionUsec_ = qBound(rangeStartUsec_, position_usec, rangeEndUsec_);
+	const bool wasFollowingLive = followLive_;
 	followLive_ = positionUsec_ >= rangeEndUsec_ - 200000;
+	if (!wasFollowingLive && followLive_) {
+		/* Dragged back to the live edge: the axis has to show the live window
+		 * again instead of staying zoomed where the review started. */
+		timeline_->ResetZoom();
+	}
 
 	UpdateLabels();
 	UpdateGoLiveState();
@@ -1510,7 +1594,7 @@ void OBSReplayBufferPanel::PositionChanged(qint64 position_usec, bool finished)
 	 * plugin keeps only the newest request, so a short throttle is enough to
 	 * keep the decoder from being flooded. */
 	if (finished) {
-		blog(LOG_INFO, "[replay buffer] review %.3fs", (double)positionUsec_ / 1000000.0);
+		blog(LOG_DEBUG, "[replay buffer] review %.3fs", (double)positionUsec_ / 1000000.0);
 		RequestFrame();
 	} else if (!fullFramePending_) {
 		/* Ask for the next frame as soon as the previous one arrived. The plugin
@@ -1558,8 +1642,11 @@ void OBSReplayBufferPanel::RequestFrame(bool snap)
 		blog(LOG_DEBUG, "[replay buffer] review %.3fs: no keyframe at this position",
 		     (double)positionUsec_ / 1000000.0);
 		/* Nothing decodable at this position; drop the stale frame so the
-		 * canvas falls back to the live picture. */
+		 * canvas falls back to the live picture, and cancel the request that is
+		 * still in flight so it cannot paint the previous position later. */
+		CancelFullFrame();
 		ClearReviewFrame();
+		SetReviewStale(false);
 		return;
 	}
 
@@ -1602,14 +1689,15 @@ void OBSReplayBufferPanel::RequestFullFrame(int64_t time_usec)
 	calldata_free(&cd);
 
 	if (!accepted) {
-		blog(LOG_INFO, "[replay buffer] review: the decoder refused the request");
+		blog(LOG_DEBUG, "[replay buffer] review: the decoder refused the request");
+		SetReviewStale(true);
 		return;
 	}
 
 	fullFramePending_ = true;
 	pendingFullFrameId_ = requestId;
 
-	blog(LOG_INFO, "[replay buffer] review: decode request %llu queued", (unsigned long long)requestId);
+	blog(LOG_DEBUG, "[replay buffer] review: decode request %llu queued", (unsigned long long)requestId);
 	fullFrameElapsed_.restart();
 	fullFrameTimer_.start();
 }
@@ -1656,21 +1744,24 @@ void OBSReplayBufferPanel::PollFullFrame()
 		if (fullFrameElapsed_.elapsed() > 3000) {
 			blog(LOG_INFO, "[replay buffer] review: decode timed out");
 			CancelFullFrame();
+			SetReviewStale(true);
 		}
 		return;
 	}
 
-	blog(LOG_INFO, "[replay buffer] review: copy status %d %dx%d (%lld bytes)", status, width, height, size);
+	blog(LOG_DEBUG, "[replay buffer] review: copy status %d %dx%d (%lld bytes)", status, width, height, size);
 
 	fullFrameTimer_.stop();
 	fullFramePending_ = false;
 
 	if (status == REPLAY_BUFFER_FRAME_FAILED || size <= 0 || width <= 0 || height <= 0) {
+		SetReviewStale(true);
 		return;
 	}
 
 	QImage image(width, height, QImage::Format_RGBA8888);
 	if (image.isNull()) {
+		SetReviewStale(true);
 		return;
 	}
 
@@ -1685,16 +1776,18 @@ void OBSReplayBufferPanel::PollFullFrame()
 	calldata_free(&copy);
 
 	if (copyStatus != REPLAY_BUFFER_FRAME_READY || copied <= 0) {
-		blog(LOG_INFO, "[replay buffer] review: copy returned status %d (%lld bytes)", copyStatus, copied);
+		blog(LOG_DEBUG, "[replay buffer] review: copy returned status %d (%lld bytes)", copyStatus, copied);
+		SetReviewStale(true);
 		return;
 	}
 
 	/* The canvas only shows this frame while the playhead is off the live
 	 * edge; at the live edge the program preview is already correct. */
 	if (Reviewing()) {
+		SetReviewStale(false);
 		SetReviewFrame(image);
 	} else {
-		blog(LOG_INFO, "[replay buffer] review: frame ready but the panel is not reviewing");
+		blog(LOG_DEBUG, "[replay buffer] review: frame ready but the panel is not reviewing");
 	}
 }
 
@@ -1772,7 +1865,12 @@ void OBSReplayBufferPanel::NextKeyframe()
 void OBSReplayBufferPanel::JumpTo(int64_t position_usec)
 {
 	positionUsec_ = qBound(rangeStartUsec_, position_usec, rangeEndUsec_);
+	const bool wasFollowingLive = followLive_;
 	followLive_ = positionUsec_ >= rangeEndUsec_ - 200000;
+	if (!wasFollowingLive && followLive_) {
+		/* Stepping onto the newest keyframe is another way back to live. */
+		timeline_->ResetZoom();
+	}
 
 	timeline_->SetPosition(positionUsec_);
 	UpdateLabels();
@@ -1847,6 +1945,7 @@ void OBSReplayBufferPanel::ExportSelection()
 	timeline_->SetSelection(actualStart, actualEnd);
 
 	exportRunning_ = true;
+	exportElapsed_.restart();
 	exportTimer_.start();
 	UpdateControls();
 	UpdateLabels();
@@ -1871,6 +1970,8 @@ void OBSReplayBufferPanel::PollExport()
 	if (!output) {
 		exportRunning_ = false;
 		exportTimer_.stop();
+		UpdateControls();
+		UpdateLabels();
 		return;
 	}
 
@@ -1883,6 +1984,16 @@ void OBSReplayBufferPanel::PollExport()
 	calldata_free(&cd);
 
 	if (state == REPLAY_BUFFER_EXPORT_RUNNING) {
+		if (exportElapsed_.elapsed() > kExportTimeoutMs) {
+			/* Free the UI without touching the mux thread: the helper may still be
+			 * writing, but the controls must not stay disabled forever. */
+			exportRunning_ = false;
+			exportTimer_.stop();
+			UpdateControls();
+			UpdateLabels();
+			QMessageBox::warning(main_, QTStr("Basic.Main.Preview.ReplayBuffer.Title"),
+					     QTStr("Basic.Main.Preview.ReplayBuffer.ExportTimeout"));
+		}
 		return;
 	}
 
