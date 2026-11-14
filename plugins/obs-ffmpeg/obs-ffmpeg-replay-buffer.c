@@ -217,12 +217,23 @@ static void cache_compact_gops(replay_buffer_cache_t *cache)
 static void cache_drop_front_gop(replay_buffer_cache_t *cache)
 {
 	const uint64_t start = cache_gop_at(cache, 0)->first_index;
-	const uint64_t end = cache_gop_count(cache) > 1 ? cache_gop_at(cache, 1)->first_index : cache->next_index;
+	uint64_t end = cache_gop_count(cache) > 1 ? cache_gop_at(cache, 1)->first_index : cache->next_index;
+
+	/* A duplicate or otherwise empty GOP has end == start. Clamp instead of
+	 * letting first_index move backwards, then still retire the entry below. */
+	if (end < start)
+		end = start;
 
 	for (uint64_t index = start; index < end && index < cache->next_index; index++)
 		cache_release_slot(cache, index);
 
 	cache->first_index = end;
+
+	/* Retire the front entry even when it owned no packets. Otherwise two GOPs
+	 * that start at the same index would leave first_index unchanged and the
+	 * trim loop would call this function forever. */
+	if (cache_gop_count(cache) > 0)
+		cache->gops_head++;
 
 	/* The GOP index follows the packets, not the other way round: every entry
 	 * whose packets are gone is dropped, so the two can never disagree even if a
@@ -260,7 +271,12 @@ static void cache_trim(replay_buffer_cache_t *cache)
 		if (!over_size && !over_time)
 			break;
 
+		const size_t before = cache_gop_count(cache);
 		cache_drop_front_gop(cache);
+		/* Defensive: a dropped entry must make progress even if the GOP index
+		 * was already inconsistent. Never spin the output thread. */
+		if (cache_gop_count(cache) >= before)
+			break;
 	}
 }
 
@@ -401,14 +417,9 @@ bool replay_buffer_cache_push(replay_buffer_cache_t *cache, struct encoder_packe
 		gop.start_dts_usec = packet->dts_usec;
 		gop.first_index = cache->next_index;
 
-		if (!da_push_back(cache->gops, &gop)) {
-			obs_encoder_packet_release(&slot->packet);
-			slot->magic = 0;
-			cache->need_keyframe = true;
-			cache_note_drop(cache, packet, true, true);
-			pthread_mutex_unlock(&cache->mutex);
-			return false;
-		}
+		/* darray_push_back returns the index of the new element, not a
+		 * success flag; it aborts on allocation failure. */
+		da_push_back(cache->gops, &gop);
 	}
 
 	cache->next_index++;
@@ -692,12 +703,7 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_range_snapshot(replay_buffe
 
 			struct encoder_packet ref;
 			obs_encoder_packet_ref(&ref, &slot->packet);
-			if (!da_push_back(snapshot->packets, &ref)) {
-				obs_encoder_packet_release(&ref);
-				pthread_mutex_unlock(&cache->mutex);
-				replay_buffer_snapshot_release(snapshot);
-				return NULL;
-			}
+			da_push_back(snapshot->packets, &ref);
 		}
 	}
 
@@ -806,12 +812,7 @@ replay_buffer_snapshot_t *replay_buffer_cache_create_snapshot(replay_buffer_cach
 
 		struct encoder_packet packet;
 		obs_encoder_packet_ref(&packet, &slot->packet);
-		if (!da_push_back(snapshot->packets, &packet)) {
-			obs_encoder_packet_release(&packet);
-			pthread_mutex_unlock(&cache->mutex);
-			replay_buffer_snapshot_release(snapshot);
-			return NULL;
-		}
+		da_push_back(snapshot->packets, &packet);
 	}
 
 	pthread_mutex_unlock(&cache->mutex);

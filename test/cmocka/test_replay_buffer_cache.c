@@ -47,11 +47,11 @@ static void test_push_index_and_range(void **state)
 	assert_non_null(cache);
 	replay_buffer_cache_set_limits(cache, 0, 60 * 1000000LL);
 
-	push_packet(cache, OBS_ENCODER_VIDEO, true, 0, 100, false);
-	push_packet(cache, OBS_ENCODER_AUDIO, false, 100000, 10, false);
-	push_packet(cache, OBS_ENCODER_VIDEO, false, 200000, 20, false);
-	push_packet(cache, OBS_ENCODER_VIDEO, true, 1000000, 110, false);
-	push_packet(cache, OBS_ENCODER_AUDIO, false, 1100000, 10, false);
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, 0, 100, false));
+	assert_true(push_packet(cache, OBS_ENCODER_AUDIO, false, 100000, 10, false));
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, false, 200000, 20, false));
+	assert_true(push_packet(cache, OBS_ENCODER_VIDEO, true, 1000000, 110, false));
+	assert_true(push_packet(cache, OBS_ENCODER_AUDIO, false, 1100000, 10, false));
 
 	assert_int_equal(replay_buffer_cache_get_keyframe_count(cache), 2);
 

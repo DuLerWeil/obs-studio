@@ -586,8 +586,15 @@ void OBSReplayBufferTimeline::mousePressEvent(QMouseEvent *event)
 		return;
 	}
 
-	if (event->button() != Qt::LeftButton || rangeEnd_ <= rangeStart_) {
+	if (event->button() != Qt::LeftButton) {
 		QWidget::mousePressEvent(event);
+		return;
+	}
+
+	if (rangeEnd_ <= rangeStart_) {
+		/* The empty scale has no moment to seek to; keep the press away from
+		 * the preview underneath. */
+		event->accept();
 		return;
 	}
 
@@ -652,7 +659,9 @@ void OBSReplayBufferTimeline::mouseReleaseEvent(QMouseEvent *event)
 void OBSReplayBufferTimeline::mouseDoubleClickEvent(QMouseEvent *event)
 {
 	if (rangeEnd_ <= rangeStart_) {
-		QWidget::mouseDoubleClickEvent(event);
+		/* Nothing is buffered yet (or the panel is showing its empty scale).
+		 * Swallow the event instead of letting it bubble into the preview. */
+		event->accept();
 		return;
 	}
 
