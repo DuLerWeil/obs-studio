@@ -361,6 +361,47 @@ static void test_range_boundaries_and_clamping(void **state)
 	replay_buffer_cache_destroy(cache);
 }
 
+static void test_end_keyframe_is_included(void **state)
+{
+	UNUSED_PARAMETER(state);
+
+	replay_buffer_cache_t *cache = replay_buffer_cache_create(0);
+	assert_non_null(cache);
+	replay_buffer_cache_set_limits(cache, 0, 60 * 1000000LL);
+
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 0, 16, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, false, 500000, 16, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 1000000, 16, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, false, 1500000, 16, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, true, 2000000, 16, false);
+	push_packet(cache, OBS_ENCODER_VIDEO, false, 2500000, 16, false);
+
+	int64_t actual_start = -1;
+	int64_t actual_end = -1;
+
+	/* 1.6s is nearer to the 2s keyframe than to the 1s one, so the export has
+	 * to run up to that keyframe: it is the picture shown at the end. */
+	replay_buffer_snapshot_t *snapshot =
+		replay_buffer_cache_create_range_snapshot(cache, 800000, 1600000, &actual_start, &actual_end);
+	assert_non_null(snapshot);
+	assert_int_equal(actual_start, 0);
+	assert_int_equal(actual_end, 2000000);
+
+	const size_t count = replay_buffer_snapshot_get_packet_count(snapshot);
+	const struct encoder_packet *packet = replay_buffer_snapshot_get_packet(snapshot, count - 1);
+	assert_non_null(packet);
+	assert_true(packet->keyframe);
+	assert_int_equal(packet->dts_usec, 2000000);
+	replay_buffer_snapshot_release(snapshot);
+
+	/* When the earlier keyframe is the nearer one, nothing is added. */
+	assert_true(replay_buffer_cache_resolve_range(cache, 800000, 1400000, &actual_start, &actual_end));
+	assert_int_equal(actual_start, 0);
+	assert_int_equal(actual_end, 1000000);
+
+	replay_buffer_cache_destroy(cache);
+}
+
 static void test_info_is_consistent(void **state)
 {
 	UNUSED_PARAMETER(state);
@@ -920,6 +961,7 @@ int main(void)
 		cmocka_unit_test(test_zero_time_limit_keeps_history),
 		cmocka_unit_test(test_range_snapshot_snaps_start_and_truncates_end),
 		cmocka_unit_test(test_range_boundaries_and_clamping),
+		cmocka_unit_test(test_end_keyframe_is_included),
 		cmocka_unit_test(test_info_is_consistent),
 		cmocka_unit_test(test_push_reports_dropped_packets),
 		cmocka_unit_test(test_block_growth_and_eviction),

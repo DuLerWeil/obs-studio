@@ -775,6 +775,17 @@ static bool cache_resolve_range_locked(replay_buffer_cache_t *cache, int64_t sta
 		return false;
 	}
 
+	/* The picture the reviewer associates with the end is the keyframe nearest
+	 * to it, which can start slightly after the requested moment. Keep writing
+	 * up to that keyframe so the boundary frame is in the file, rather than
+	 * stopping on the packet before it. Nearest (not strictly later) keeps the
+	 * extension within half a GOP. */
+	int64_t resolved_end = end_usec;
+	const size_t end_gop = cache_nearest_gop(cache, end_usec);
+	if (cache->gops.array[end_gop].start_dts_usec > end_usec) {
+		resolved_end = cache->gops.array[end_gop].start_dts_usec;
+	}
+
 	bool have_packet = false;
 	int64_t actual_end = aligned_start;
 	uint64_t last = gop->first_index;
@@ -784,7 +795,7 @@ static bool cache_resolve_range_locked(replay_buffer_cache_t *cache, int64_t sta
 		if (!slot) {
 			break;
 		}
-		if (slot->packet.dts_usec > end_usec) {
+		if (slot->packet.dts_usec > resolved_end) {
 			break;
 		}
 
