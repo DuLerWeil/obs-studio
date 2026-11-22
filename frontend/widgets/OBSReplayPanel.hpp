@@ -18,7 +18,6 @@ class OBSBasic;
 class QAction;
 class QHBoxLayout;
 class QLabel;
-class QLayout;
 class QPainter;
 class QTimer;
 class QToolButton;
@@ -130,22 +129,26 @@ private:
 	bool hovering_ = false;
 };
 
-/* Replay controls docked under the program preview, below the zoom
- * controls and the scroll bars. The widget is a normal member of the preview
- * layout, so it never covers the program output. */
+/* Replay controls docked in the preview column, in their own row of the preview
+ * grid directly under the preview's control row and sharing its width. Both the
+ * panel and its fold button are ordinary widgets of OBSBasic.ui, so the layout is
+ * complete before the window is shown; the panel is displayed and hidden only when
+ * the replay buffer starts and stops, and never covers the program output. */
 class OBSReplayPanel : public QWidget {
 	Q_OBJECT
 
 public:
-	/* preview is the program output widget; the reviewed frame is drawn into
-	 * its OBS display, so the canvas itself shows the selected moment. */
-	OBSReplayPanel(OBSBasic *main, OBSQTDisplay *preview);
+	explicit OBSReplayPanel(QWidget *parent = nullptr);
 	~OBSReplayPanel() override;
 
-	/* Hands the fold button to the preview's own control row, so it sits next to
-	 * the horizontal scroll bar instead of the playback row. When a reference
-	 * widget is given, the button takes the size of its drop-down arrow. */
-	void SetCollapseButtonLayout(QLayout *layout, QWidget *reference = nullptr);
+	/* main is the window whose replay output the panel drives; preview is the
+	 * program output widget whose OBS display shows the reviewed frame. Called
+	 * once, right after setupUi(). */
+	void SetContext(OBSBasic *main, OBSQTDisplay *preview);
+	/* Hands over the fold button declared next to the preview's control row, so
+	 * it sits by the horizontal scroll bar. When a reference widget is given, the
+	 * button takes the size of its drop-down arrow. */
+	void SetCollapseButton(QToolButton *button, QWidget *reference = nullptr);
 
 public slots:
 	void Start();
@@ -202,7 +205,8 @@ private:
 
 	void ShowExportError(int error);
 
-	OBSBasic *main_;
+	/* Set by SetContext(); null until the panel is wired to the window. */
+	OBSBasic *main_ = nullptr;
 
 	QLabel *cacheLabel_;
 	QToolButton *prevButton_;
@@ -210,7 +214,9 @@ private:
 	QToolButton *saveButton_;
 	QToolButton *exportButton_;
 	QToolButton *goLiveButton_;
-	QToolButton *collapseButton_;
+	/* Owned by the ui, not by the panel: it lives in the preview's control row, so
+	 * it is tracked weakly and simply disappears with the window. */
+	QPointer<QToolButton> collapseButton_;
 	QAction *exportAction_;
 	/* Glyph size picked for the fold button when it joins the preview row. */
 	int collapseIconSide_ = 12;

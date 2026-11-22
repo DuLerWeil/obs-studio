@@ -140,20 +140,18 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	ui->setupUi(this);
 	ui->previewDisabledWidget->setVisible(false);
 
-	/* Replay timeline docked under the preview, below the zoom controls
-	 * and the scroll bars. It is part of the preview column, so projector
-	 * windows never show it and it never covers the program output. */
-	auto *panel = new OBSReplayPanel(this, ui->preview);
-	replayPanel = panel;
-	/* Added above the preview's own control row, as a direct item of the
-	 * preview column so no wrapper widget is needed. */
-	ui->previewXContainerLayout->insertWidget(0, panel);
-	/* The fold button sits at the right end of the preview's own control row,
-	 * next to the horizontal scroll bar. */
-	panel->SetCollapseButtonLayout(ui->previewControlsLayout, ui->previewScalingMode);
-	connect(this, &OBSBasic::ReplayBufStarted, panel, &OBSReplayPanel::Start);
-	connect(this, &OBSBasic::ReplayBufStopping, panel, &OBSReplayPanel::Stop);
-	connect(this, &OBSBasic::ReplayBufStopped, panel, &OBSReplayPanel::Stop);
+	/* The replay strip and its fold button are ordinary widgets of OBSBasic.ui:
+	 * the strip is its own row of the preview grid, in the same column as the
+	 * preview's control row so the two keep the same width and the strip hangs
+	 * directly under it, and the button ends that control row next to the
+	 * horizontal scroll bar. Nothing is inserted into the preview layout from
+	 * here; the panel is only told what it works with. */
+	ui->replayPanel->SetContext(this, ui->preview);
+	replayPanel = ui->replayPanel;
+	ui->replayPanel->SetCollapseButton(ui->replayCollapseButton, ui->previewScalingMode);
+	connect(this, &OBSBasic::ReplayBufStarted, ui->replayPanel, &OBSReplayPanel::Start);
+	connect(this, &OBSBasic::ReplayBufStopping, ui->replayPanel, &OBSReplayPanel::Stop);
+	connect(this, &OBSBasic::ReplayBufStopped, ui->replayPanel, &OBSReplayPanel::Stop);
 
 	/* Set up streaming connections */
 	connect(

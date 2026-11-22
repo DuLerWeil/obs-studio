@@ -999,29 +999,15 @@ void OBSReplayTimeline::leaveEvent(QEvent *event)
 /* Docked panel                                                              */
 /* ------------------------------------------------------------------------- */
 
-OBSReplayPanel::OBSReplayPanel(OBSBasic *main, OBSQTDisplay *preview)
-	: QWidget(nullptr),
-	  main_(main),
-	  preview_(preview)
+OBSReplayPanel::OBSReplayPanel(QWidget *parent) : QWidget(parent)
 {
 	setObjectName(QStringLiteral("replayPanel"));
-	/* The panel lives in the preview column's layout, below the zoom controls
-	 * and the scroll bars, so it never covers the program output and needs no
-	 * native window of its own. It may be squeezed when the column is short,
-	 * but never grows past the height of its own rows. */
+	/* The panel is a widget of OBSBasic.ui: it has its own row in the preview grid,
+	 * directly under the preview's control row, so it never covers the program
+	 * output and needs no native window of its own. It may be squeezed when the
+	 * column is short, but never grows past the height of its own rows. */
 	setAutoFillBackground(false);
 	setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
-
-	/* A recreated display destroys its draw callbacks; drop the handle and put
-	 * the reviewed frame back on the new one, so moving the window between
-	 * monitors does not require another seek to see it again. */
-	if (preview_) {
-		connect(preview_, &OBSQTDisplay::DisplayCreated, this, [this](OBSQTDisplay *) {
-			reviewDisplay_ = nullptr;
-			/* Re-attaches only while a historical moment is being reviewed. */
-			UpdateReviewState();
-		});
-	}
 
 	/* The scale and its two markers carry the timing, so the only text left is
 	 * the transient export status. */
@@ -1072,12 +1058,6 @@ OBSReplayPanel::OBSReplayPanel(OBSBasic *main, OBSQTDisplay *preview)
 	exportButton_->setToolButtonStyle(Qt::ToolButtonIconOnly);
 	exportButton_->setDefaultAction(exportAction_);
 
-	collapseButton_ = new QToolButton(this);
-	collapseButton_->setAutoRaise(true);
-	collapseButton_->setFocusPolicy(Qt::NoFocus);
-	collapseButton_->setIconSize(QSize(iconSize, iconSize));
-	connect(collapseButton_, &QToolButton::clicked, this, &OBSReplayPanel::ToggleCollapsed);
-
 	timeline_ = new OBSReplayTimeline(this);
 
 	/* The scale takes the whole left side and every control is grouped at the
@@ -1114,27 +1094,50 @@ OBSReplayPanel::OBSReplayPanel(OBSBasic *main, OBSQTDisplay *preview)
 	connect(timeline_, &OBSReplayTimeline::PositionChanged, this, &OBSReplayPanel::PositionChanged);
 	connect(timeline_, &OBSReplayTimeline::SelectionChanged, this, &OBSReplayPanel::SelectionChanged);
 	connect(timeline_, &OBSReplayTimeline::GoLiveRequested, this, &OBSReplayPanel::GoLive);
-	connect(timeline_, &OBSReplayTimeline::MarkerDoubleClicked, this,
-		&OBSReplayPanel::MarkerDoubleClicked);
+	connect(timeline_, &OBSReplayTimeline::MarkerDoubleClicked, this, &OBSReplayPanel::MarkerDoubleClicked);
 	connect(goLiveButton_, &QToolButton::clicked, this, &OBSReplayPanel::ToggleLivePause);
 	connect(prevButton_, &QToolButton::clicked, this, &OBSReplayPanel::PreviousKeyframe);
 	connect(nextButton_, &QToolButton::clicked, this, &OBSReplayPanel::NextKeyframe);
 
+	/* OBSBasic.ui already declares the strip as hidden; forcing it here as well
+	 * keeps the state independent of how the widget was created, and only Start()
+	 * brings the strip back. */
 	UpdateCollapsedState();
-	/* The fold button lives in the preview's control row now; it only appears
-	 * once the replay actually runs. */
-	ShowPanel(false);
+	hide();
 }
 
-void OBSReplayPanel::SetCollapseButtonLayout(QLayout *layout, QWidget *reference)
+void OBSReplayPanel::SetContext(OBSBasic *main, OBSQTDisplay *preview)
 {
-	if (!layout || !collapseButton_) {
+	main_ = main;
+	preview_ = preview;
+
+	if (!preview_) {
 		return;
 	}
 
-	layout->addWidget(collapseButton_);
+	/* A recreated display destroys its draw callbacks; drop the handle and put the
+	 * reviewed frame back on the new one, so moving the window between monitors
+	 * does not require another seek to see it again. */
+	connect(preview_, &OBSQTDisplay::DisplayCreated, this, [this](OBSQTDisplay *) {
+		reviewDisplay_ = nullptr;
+		/* Re-attaches only while a historical moment is being reviewed. */
+		UpdateReviewState();
+	});
+}
 
+void OBSReplayPanel::SetCollapseButton(QToolButton *button, QWidget *reference)
+{
+	collapseButton_ = button;
 	foldReference_ = reference;
+
+	if (!collapseButton_) {
+		return;
+	}
+
+	connect(collapseButton_, &QToolButton::clicked, this, &OBSReplayPanel::ToggleCollapsed);
+	/* Same as the strip: it belongs to the preview's control row, so it starts
+	 * hidden and ShowPanel() keeps it in step. */
+	collapseButton_->setVisible(false);
 	UpdateCollapseButtonSize();
 }
 
@@ -1212,11 +1215,9 @@ OBSReplayPanel::~OBSReplayPanel()
 		reviewTexture_ = nullptr;
 	}
 
-	/* The fold button is parented to the preview's control row, so it would
-	 * outlive the panel it drives; take it down with us. */
-	if (collapseButton_ && collapseButton_->parent() != this) {
-		collapseButton_->deleteLater();
-	}
+	/* The fold button belongs to the ui, next to the preview's control row, and
+	 * goes away with the window; the weak pointer is only cleared here. */
+	collapseButton_ = nullptr;
 }
 
 void OBSReplayPanel::resizeEvent(QResizeEvent *event)
@@ -1250,14 +1251,14 @@ void OBSReplayPanel::Start()
 	positionUsec_ = 0;
 	timeline_->ResetZoom();
 
+	/* Starting the replay buffer is what puts the strip on screen, and stopping
+	 * it is what takes the strip away again: the panel keeps its place in the
+	 * preview column for the whole session, whether or not the cache holds a
+	 * keyframe yet. */
 	UpdateCollapsedState();
+	ShowPanel(true);
 	infoTimer_.start();
 	RefreshInfo();
-
-	/* Show the strip even if the first tick had no data yet. */
-	if (Active()) {
-		ShowPanel(true);
-	}
 }
 
 void OBSReplayPanel::Stop()
@@ -1481,9 +1482,11 @@ void OBSReplayPanel::ShowPanel(bool show)
 		UpdatePanelHeight();
 		UpdateCollapseButtonSize();
 	}
-	/* The fold button is parented to the preview's own control row, so it has to
-	 * follow the panel explicitly instead of being hidden along with it. */
-	collapseButton_->setVisible(show);
+	/* The fold button lives in the preview's own control row, so it has to follow
+	 * the panel explicitly instead of being hidden along with it. */
+	if (collapseButton_) {
+		collapseButton_->setVisible(show);
+	}
 }
 
 void OBSReplayPanel::HidePanel()
@@ -1514,9 +1517,17 @@ void OBSReplayPanel::HidePanel()
 void OBSReplayPanel::UpdatePanelHeight()
 {
 	/* Hiding rows changes the layout's size hint, but the preview column only
-	 * re-reads it once the geometry is invalidated explicitly. */
+	 * re-reads a child's height once the layouts above it are invalidated
+	 * explicitly, so every layout between the panel and the window is marked
+	 * dirty. */
 	if (QLayout *panelLayout = layout()) {
 		panelLayout->invalidate();
+	}
+
+	for (QWidget *widget = parentWidget(); widget; widget = widget->parentWidget()) {
+		if (QLayout *outerLayout = widget->layout()) {
+			outerLayout->invalidate();
+		}
 	}
 
 	updateGeometry();
@@ -1581,18 +1592,15 @@ void OBSReplayPanel::RefreshInfo()
 	}
 
 	if (!Active()) {
-		/* Keep the timer polling: hiding through HidePanel() from here would stop
-		 * it, and a tick that landed before the output reported itself active used
-		 * to take the panel down for the rest of the session. The strip is hidden
-		 * without touching the timers so nothing stale stays on screen. */
-		ShowPanel(false);
+		/* Whether the strip is on screen is decided by Start() and Stop() alone.
+		 * A tick that lands before the output reports itself active only drops the
+		 * reviewed frame; it never takes the strip off screen. */
 		SetReviewActive(false);
 		return;
 	}
 
 	OBSOutputAutoRelease output = main_->GetReplayOutput();
 	if (!output) {
-		ShowPanel(false);
 		SetReviewActive(false);
 		return;
 	}
@@ -1622,7 +1630,6 @@ void OBSReplayPanel::RefreshInfo()
 		timeline_->SetRange(0, 0);
 		timeline_->SetPosition(0);
 		UpdateControls();
-		ShowPanel(true);
 		SetReviewActive(false);
 		SetReviewStale(false);
 		return;
@@ -1711,13 +1718,8 @@ void OBSReplayPanel::RefreshInfo()
 	UpdateLabels();
 	UpdateControls();
 
-	/* The panel is docked, so it does not have to compete with the preview for
-	 * space: show it whenever the buffer is active and let the column layout
-	 * decide how much room the rows get. */
-	if (!isVisible()) {
-		UpdatePanelHeight();
-		ShowPanel(true);
-	}
+	/* The strip stays where Start() put it: a refresh only updates the content of
+	 * the rows, never whether the strip is on screen. */
 
 	/* The rolling window may have dropped the reviewed position and pulled the
 	 * playhead back to the live edge; the canvas has to follow that. */
